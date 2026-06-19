@@ -1,0 +1,13 @@
+[interface]
+name = "utun10"
+address = "10.77.0.1/24"
+listen = "0.0.0.0:27777"
+transport = "udp"
+mtu = 1280
+
+[[peer]]
+name = "node-b"
+endpoint = "127.0.0.1:27778"
+allowed_ips = ["10.77.0.2/32"]
+psk = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
+persistent_keepalive = 25

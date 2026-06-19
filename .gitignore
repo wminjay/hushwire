@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+.vscode/
+.idea/
