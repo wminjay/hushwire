@@ -128,7 +128,7 @@ fn ipv4_forwarding() -> anyhow::Result<Option<bool>> {
     {
         let value = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
             .context("failed to read /proc/sys/net/ipv4/ip_forward")?;
-        return Ok(Some(value.trim() == "1"));
+        Ok(Some(value.trim() == "1"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -177,7 +177,7 @@ fn host_route_to(ip: IpAddr) -> anyhow::Result<HostRoute> {
             .args(["route", "get", &ip.to_string()])
             .output()
             .context("failed to run ip route get")?;
-        return command_output(output);
+        command_output(output)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

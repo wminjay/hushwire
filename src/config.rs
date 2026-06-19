@@ -25,16 +25,11 @@ pub struct InterfaceConfig {
     pub mtu: u16,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportConfig {
+    #[default]
     Udp,
-}
-
-impl Default for TransportConfig {
-    fn default() -> Self {
-        Self::Udp
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
