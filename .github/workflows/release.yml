@@ -5,7 +5,6 @@ on:
     tags:
       - "v*"
 
-# Cancel in-progress runs for the same tag when re-pushing.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -18,18 +17,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # Linux: statically linked against musl so the binary runs on any
+          # glibc version (Debian 11's 2.31, Alpine, etc.) without a system
+          # dependency. This is the standard approach for portable Rust CLI
+          # release binaries.
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             artifact: hushwire-x86_64-linux
-            use-qemu: false
-          - target: aarch64-unknown-linux-gnu
+            use-cross: false
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             artifact: hushwire-aarch64-linux
-            use-qemu: true
+            use-cross: true
+          # macOS: native build on an Apple Silicon runner.
           - target: aarch64-apple-darwin
             runner: macos-latest
             artifact: hushwire-aarch64-macos
-            use-qemu: false
+            use-cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -43,34 +47,34 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Linux ARM64: cross-compile via QEMU emulation. Slower (~10-15m) but
-      # needs no manual cross-toolchain setup and produces a native binary.
-      - name: Install QEMU (ARM64 Linux only)
-        if: matrix.use-qemu
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+      - name: Install musl tools (native Linux musl)
+        if: runner.os == 'Linux' && !matrix.use-cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y build-essential
-
-      - name: Build (native)
-        if: ${{ !matrix.use-qemu }}
+      - name: Build (native musl)
+        if: runner.os == 'Linux' && !matrix.use-cross
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (QEMU-emulated cross)
-        if: matrix.use-qemu
+      - name: Build (cross for ARM64 musl)
+        if: matrix.use-cross
         run: |
           cargo install cross
           cross build --release --target ${{ matrix.target }}
+
+      - name: Build (macOS native)
+        if: runner.os == 'macOS'
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.artifact }}.tar.gz hushwire
           cd ../../..
-          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          if command -v shasum >/dev/null; then
+            shasum -a 256 ${{ matrix.artifact }}.tar.gz
+          else
+            sha256sum ${{ matrix.artifact }}.tar.gz
+          fi > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
