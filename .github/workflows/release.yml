@@ -100,11 +100,31 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Build release body (notes + auto changelog)
+        id: body
+        run: |
+          {
+            cat .github/RELEASE_NOTES.md
+            echo ""
+            echo "---"
+            echo ""
+          } > /tmp/release-body.md
+
+          # Fetch the auto-generated changelog from GitHub and append it.
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ github.ref_name }}" >> /tmp/release-body.md
+          fi
+
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/release-body.md >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          body_path: .github/RELEASE_NOTES.md
-          generate_release_notes: true
+          body: ${{ steps.body.outputs.body }}
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
