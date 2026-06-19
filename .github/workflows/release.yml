@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Cancel in-progress runs for the same tag when re-pushing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: hushwire-x86_64-linux
+            use-qemu: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: hushwire-aarch64-linux
+            use-qemu: true
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            artifact: hushwire-aarch64-macos
+            use-qemu: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Linux ARM64: cross-compile via QEMU emulation. Slower (~10-15m) but
+      # needs no manual cross-toolchain setup and produces a native binary.
+      - name: Install QEMU (ARM64 Linux only)
+        if: matrix.use-qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y build-essential
+
+      - name: Build (native)
+        if: ${{ !matrix.use-qemu }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (QEMU-emulated cross)
+        if: matrix.use-qemu
+        run: |
+          cargo install cross
+          cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact }}.tar.gz hushwire
+          cd ../../..
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    name: Publish to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
