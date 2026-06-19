@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -143,11 +144,13 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             };
 
             let encoded = auth::encode_packet(frame, &route.peer.psk, auth::MsgType::Data);
-            if let Err(error) = transport_writer.send_to(&encoded, route.peer.endpoint) {
+            let endpoint =
+                resolve_endpoint(&state_for_sender, &route.peer.name, route.peer.endpoint);
+            if let Err(error) = transport_writer.send_to(&encoded, endpoint) {
                 error!(
                     %error,
                     peer = %route.peer.name,
-                    endpoint = %route.peer.endpoint,
+                    endpoint = %endpoint,
                     bytes = size,
                     "failed to send UDP packet"
                 );
@@ -158,7 +161,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
 
             debug!(
                 peer = %route.peer.name,
-                endpoint = %route.peer.endpoint,
+                endpoint = %endpoint,
                 route = %route.prefix,
                 src = %ipv4.source(),
                 dst = %destination,
@@ -253,10 +256,12 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 if now.duration_since(*sent).as_secs() >= interval {
                     let packet =
                         auth::encode_packet(b"", &route.peer.psk, auth::MsgType::Keepalive);
-                    if keepalive_transport
-                        .send_to(&packet, route.peer.endpoint)
-                        .is_ok()
-                    {
+                    let endpoint = resolve_endpoint(
+                        &state_for_keepalive,
+                        &route.peer.name,
+                        route.peer.endpoint,
+                    );
+                    if keepalive_transport.send_to(&packet, endpoint).is_ok() {
                         state_for_keepalive.record_tx(&route.peer.name, packet.len());
                     }
                     *sent = now;
@@ -302,6 +307,23 @@ struct TunDevice {
     reader: tun::platform::posix::Reader,
     writer: tun::platform::posix::Writer,
     packet_information: bool,
+}
+
+/// Resolve the destination endpoint for outbound packets to a peer.
+///
+/// Prefers the address learned from a recent inbound packet (NAT traversal /
+/// roaming) and falls back to the statically configured endpoint when no
+/// packet has been received from the peer yet. This lets peers behind NAT
+/// establish connectivity by sending keepalives: once the server sees a
+/// packet from the peer's real source address, it replies there instead of
+/// the (possibly unreachable) configured endpoint.
+fn resolve_endpoint(state: &PeerState, peer_name: &str, configured: SocketAddr) -> SocketAddr {
+    let snapshot = state.snapshot();
+    snapshot
+        .get(peer_name)
+        .and_then(|stats| stats.current_endpoint)
+        .filter(|learned| *learned != configured)
+        .unwrap_or(configured)
 }
 
 fn create_tun(config: &Config) -> anyhow::Result<TunDevice> {
