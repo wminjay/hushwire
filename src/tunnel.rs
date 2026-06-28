@@ -11,16 +11,16 @@ use signal_hook::iterator::Signals;
 use tracing::{debug, error, info, warn};
 use x25519_dalek::StaticSecret;
 
-use crate::auth;
 use crate::config::Config;
 use crate::firewall;
-use crate::noise::{self, Session};
 use crate::packet::Ipv4Packet;
-use crate::replay;
 use crate::router::Router;
 use crate::routing::{self, InstalledRoute};
 use crate::state::PeerState;
 use crate::transport;
+use hushwire::auth;
+use hushwire::noise::{self, Session};
+use hushwire::replay;
 
 const MAX_PACKET_SIZE: usize = 65_535;
 const PACKET_INFO_SIZE: usize = 4;
@@ -352,16 +352,19 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                             sessions_for_receiver.store(&peer_name, hs.session);
                             // Reset replay filter for this peer (new session = new nonce space).
                             replay.insert(peer_name.clone(), replay::ReplayFilter::new());
-                            // Send msg2 back to the source address (we know it from the
-                            // incoming HandshakeInit — don't rely on resolve_endpoint which
-                            // may not have learned the endpoint yet).
+                            // Send msg2 back.
                             let hs_packet = auth::encode_packet(
                                 &hs.message,
                                 &route.peer.psk,
                                 auth::MsgType::HandshakeResponse,
                                 &[0u8; auth::SESSION_ID_SIZE],
                             );
-                            if let Err(e) = transport.send_to(&hs_packet, source) {
+                            let endpoint = resolve_endpoint(
+                                &state_for_receiver,
+                                &peer_name,
+                                route.peer.endpoint,
+                            );
+                            if let Err(e) = transport.send_to(&hs_packet, endpoint) {
                                 warn!(%e, peer = %peer_name, "failed to send handshake response");
                             }
                             info!(peer = %peer_name, source = %source, "handshake completed (responder), session established");

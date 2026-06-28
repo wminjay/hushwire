@@ -1,10 +1,10 @@
-mod auth;
+// Core crypto modules live in the library crate (src/lib.rs) so integration
+// tests can access them. Other modules (config, tunnel, etc.) are private to
+// the binary and import from hushwire:: directly.
 mod config;
 mod doctor;
 mod firewall;
-mod noise;
 mod packet;
-mod replay;
 mod router;
 mod routing;
 mod state;
