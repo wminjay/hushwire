@@ -352,19 +352,16 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                             sessions_for_receiver.store(&peer_name, hs.session);
                             // Reset replay filter for this peer (new session = new nonce space).
                             replay.insert(peer_name.clone(), replay::ReplayFilter::new());
-                            // Send msg2 back.
+                            // Send msg2 back to the source address (we know it from the
+                            // incoming HandshakeInit — don't rely on resolve_endpoint which
+                            // may not have learned the endpoint yet).
                             let hs_packet = auth::encode_packet(
                                 &hs.message,
                                 &route.peer.psk,
                                 auth::MsgType::HandshakeResponse,
                                 &[0u8; auth::SESSION_ID_SIZE],
                             );
-                            let endpoint = resolve_endpoint(
-                                &state_for_receiver,
-                                &peer_name,
-                                route.peer.endpoint,
-                            );
-                            if let Err(e) = transport.send_to(&hs_packet, endpoint) {
+                            if let Err(e) = transport.send_to(&hs_packet, source) {
                                 warn!(%e, peer = %peer_name, "failed to send handshake response");
                             }
                             info!(peer = %peer_name, source = %source, "handshake completed (responder), session established");
