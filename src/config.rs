@@ -23,6 +23,9 @@ pub struct InterfaceConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Base64-encoded 32-byte static private key for Noise handshake.
+    /// Generate with `hushwire genkey`.
+    pub private_key: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -37,8 +40,10 @@ pub struct PeerConfig {
     pub name: String,
     pub endpoint: SocketAddr,
     pub allowed_ips: Vec<Ipv4Net>,
-    /// Base64-encoded 32-byte pre-shared key.
+    /// Base64-encoded 32-byte pre-shared key (authentication factor).
     pub psk: String,
+    /// Base64-encoded 32-byte static public key of this peer (for Noise handshake).
+    pub public_key: String,
     /// Persistent keepalive interval in seconds (0 = disabled).
     #[serde(default)]
     pub persistent_keepalive: u16,
@@ -62,6 +67,10 @@ pub enum ConfigError {
     MtuTooSmall(u16),
     #[error("peer {0} has an invalid psk: must be base64-encoded 32 bytes")]
     InvalidPsk(String),
+    #[error("peer {0} has an invalid public_key: must be base64-encoded 32 bytes")]
+    InvalidPublicKey(String),
+    #[error("interface has an invalid private_key: must be base64-encoded 32 bytes")]
+    InvalidPrivateKey,
 }
 
 impl Config {
@@ -81,6 +90,10 @@ impl Config {
             return Err(ConfigError::MtuTooSmall(self.interface.mtu));
         }
 
+        if decode_key(&self.interface.private_key).is_none() {
+            return Err(ConfigError::InvalidPrivateKey);
+        }
+
         let mut names = HashSet::new();
         for peer in &self.peer {
             if peer.name.trim().is_empty() {
@@ -95,6 +108,9 @@ impl Config {
             if decode_psk(&peer.psk).is_none() {
                 return Err(ConfigError::InvalidPsk(peer.name.clone()));
             }
+            if decode_key(&peer.public_key).is_none() {
+                return Err(ConfigError::InvalidPublicKey(peer.name.clone()));
+            }
         }
 
         Ok(())
@@ -107,8 +123,13 @@ fn default_mtu() -> u16 {
 
 /// Decode a base64-encoded 32-byte pre-shared key.
 pub fn decode_psk(psk: &str) -> Option<[u8; 32]> {
+    decode_key(psk)
+}
+
+/// Decode a base64-encoded 32-byte key (PSK, private key, or public key).
+pub fn decode_key(key: &str) -> Option<[u8; 32]> {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    let bytes = STANDARD.decode(psk).ok()?;
+    let bytes = STANDARD.decode(key).ok()?;
     if bytes.len() != 32 {
         return None;
     }
@@ -123,6 +144,8 @@ mod tests {
 
     /// Valid base64-encoded 32-byte PSK used across config tests.
     const VALID_PSK: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
+    /// Valid base64-encoded 32-byte key (reused for private/public key in tests).
+    const VALID_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 
     fn interface() -> InterfaceConfig {
         InterfaceConfig {
@@ -131,6 +154,7 @@ mod tests {
             listen: "127.0.0.1:27777".parse().unwrap(),
             transport: TransportConfig::Udp,
             mtu: 1280,
+            private_key: VALID_KEY.to_string(),
         }
     }
 
@@ -140,6 +164,7 @@ mod tests {
             endpoint: "127.0.0.1:27778".parse().unwrap(),
             allowed_ips: vec!["10.77.0.2/32".parse().unwrap()],
             psk: VALID_PSK.to_string(),
+            public_key: VALID_KEY.to_string(),
             persistent_keepalive: 0,
         }
     }

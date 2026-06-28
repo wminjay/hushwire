@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use ipnet::Ipv4Net;
 use thiserror::Error;
+use x25519_dalek::PublicKey;
 
 use crate::config::{Config, PeerConfig};
 
@@ -11,6 +12,8 @@ pub struct Peer {
     pub name: String,
     pub endpoint: std::net::SocketAddr,
     pub psk: [u8; 32],
+    /// Peer's static public key (x25519) for Noise handshake.
+    pub public_key: PublicKey,
     pub persistent_keepalive: u16,
 }
 
@@ -74,10 +77,13 @@ impl Router {
 }
 
 fn peer_from_config(config: &PeerConfig) -> Peer {
+    let public_key_bytes = crate::config::decode_key(&config.public_key)
+        .expect("public_key validated by Config::load");
     Peer {
         name: config.name.clone(),
         endpoint: config.endpoint,
         psk: crate::config::decode_psk(&config.psk).expect("psk validated by Config::load"),
+        public_key: PublicKey::from(public_key_bytes),
         persistent_keepalive: config.persistent_keepalive,
     }
 }
@@ -99,6 +105,7 @@ mod tests {
                 listen: "127.0.0.1:27777".parse().unwrap(),
                 transport: Default::default(),
                 mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
             peer: vec![
                 peer("broad", "10.77.0.0/24", "127.0.0.1:27778"),
@@ -124,6 +131,7 @@ mod tests {
                 listen: "127.0.0.1:27777".parse().unwrap(),
                 transport: Default::default(),
                 mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
             peer: vec![peer("node-b", "10.77.0.2/32", "127.0.0.1:27778")],
         };
@@ -141,6 +149,7 @@ mod tests {
                 listen: "127.0.0.1:27777".parse().unwrap(),
                 transport: Default::default(),
                 mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
             peer: vec![peer_multi(
                 "hub",
@@ -173,6 +182,7 @@ mod tests {
                 listen: "127.0.0.1:27777".parse().unwrap(),
                 transport: Default::default(),
                 mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
             peer: vec![],
         };
@@ -191,6 +201,7 @@ mod tests {
                 listen: "127.0.0.1:27777".parse().unwrap(),
                 transport: Default::default(),
                 mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
             peer: vec![
                 peer("first", "10.77.0.2/32", "127.0.0.1:27778"),
@@ -210,6 +221,7 @@ mod tests {
             endpoint: endpoint.parse::<SocketAddr>().unwrap(),
             allowed_ips: vec![prefix.parse().unwrap()],
             psk: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
         }
     }
@@ -220,6 +232,7 @@ mod tests {
             endpoint: endpoint.parse::<SocketAddr>().unwrap(),
             allowed_ips: prefixes.iter().map(|p| p.parse().unwrap()).collect(),
             psk: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
         }
     }

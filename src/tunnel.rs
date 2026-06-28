@@ -9,10 +9,12 @@ use anyhow::Context;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use tracing::{debug, error, info, warn};
+use x25519_dalek::StaticSecret;
 
 use crate::auth;
 use crate::config::Config;
 use crate::firewall;
+use crate::noise::{self, Session};
 use crate::packet::Ipv4Packet;
 use crate::replay;
 use crate::router::Router;
@@ -23,6 +25,77 @@ use crate::transport;
 const MAX_PACKET_SIZE: usize = 65_535;
 const PACKET_INFO_SIZE: usize = 4;
 
+/// Per-peer session state, shared across threads.
+///
+/// Holds the active session (if handshake completed) keyed by peer name.
+/// The sender thread reads `send_key` + `session_id` to encrypt data; the
+/// receiver thread looks up by `session_id` to find `recv_key`.
+#[derive(Default)]
+struct SessionManager {
+    /// peer_name → active session
+    sessions: Mutex<HashMap<String, Session>>,
+    /// peer_name → pending initiator state (sender creates, receiver completes)
+    pending_init: Mutex<HashMap<String, noise::InitiatorState>>,
+}
+
+impl SessionManager {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get send_key + session_id for encrypting outgoing data.
+    fn get_send_key(
+        &self,
+        peer_name: &str,
+    ) -> Option<([u8; auth::KEY_SIZE], [u8; auth::SESSION_ID_SIZE])> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions.get(peer_name)?;
+        if session.needs_rekey() {
+            return None;
+        }
+        Some((session.send_key, session.session_id))
+    }
+
+    /// Get recv_key for a session identified by session_id (for decrypting incoming data).
+    fn get_recv_key_by_session_id(
+        &self,
+        session_id: &[u8; auth::SESSION_ID_SIZE],
+    ) -> Option<([u8; auth::KEY_SIZE], String)> {
+        let sessions = self.sessions.lock().unwrap();
+        for (peer_name, session) in sessions.iter() {
+            if &session.session_id == session_id {
+                return Some((session.recv_key, peer_name.clone()));
+            }
+        }
+        None
+    }
+
+    /// Store a newly negotiated session for a peer (replaces any existing one).
+    fn store(&self, peer_name: &str, session: Session) {
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.insert(peer_name.to_string(), session);
+    }
+
+    /// Store a pending initiator handshake state (created by sender thread,
+    /// completed by receiver thread when the response arrives).
+    fn store_pending_init(&self, peer_name: &str, state: noise::InitiatorState) {
+        let mut pending = self.pending_init.lock().unwrap();
+        pending.insert(peer_name.to_string(), state);
+    }
+
+    /// Take a pending initiator handshake state (consumes it).
+    fn take_pending_init(&self, peer_name: &str) -> Option<noise::InitiatorState> {
+        let mut pending = self.pending_init.lock().unwrap();
+        pending.remove(peer_name)
+    }
+
+    /// Check if a pending initiator handshake exists for a peer.
+    fn has_pending_init(&self, peer_name: &str) -> bool {
+        let pending = self.pending_init.lock().unwrap();
+        pending.contains_key(peer_name)
+    }
+}
+
 pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
     let router = Router::new(&config)?;
 
@@ -30,6 +103,14 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
     // since both reference the interface by name.
     let device = create_tun(&config)?;
     let transport = transport::bind(&config)?;
+
+    // Load local static private key for Noise handshake.
+    let local_static_bytes =
+        crate::config::decode_key(&config.interface.private_key).context("invalid private_key")?;
+    let local_static = Arc::new(StaticSecret::from(local_static_bytes));
+
+    // Per-peer session manager (shared across threads).
+    let session_mgr = Arc::new(SessionManager::new());
 
     let mut route_manager = routing::RouteManager::new(config.interface.name.clone());
     route_manager.setup(&router)?;
@@ -107,6 +188,13 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
     let state_for_keepalive = state.clone();
     let state_for_stats = state.clone();
 
+    // Session manager + local static key for each thread that needs them.
+    let sessions_for_sender = session_mgr.clone();
+    let sessions_for_receiver = session_mgr.clone();
+    let sessions_for_keepalive = session_mgr.clone();
+    let static_for_sender = local_static.clone();
+    let static_for_receiver = local_static.clone();
+
     let tun_to_transport = thread::spawn(move || {
         let mut packet = vec![0_u8; MAX_PACKET_SIZE];
         loop {
@@ -143,7 +231,40 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 continue;
             };
 
-            let encoded = auth::encode_packet(frame, &route.peer.psk, auth::MsgType::Data);
+            // Get session key for this peer; if no session yet, initiate handshake.
+            let (send_key, session_id) = match sessions_for_sender.get_send_key(&route.peer.name) {
+                Some(keys) => keys,
+                None => {
+                    // No active session — initiate Noise handshake, then drop this packet.
+                    // Avoid spamming: only initiate if no pending handshake exists.
+                    if sessions_for_sender.has_pending_init(&route.peer.name) {
+                        continue;
+                    }
+                    let handshake = noise::initiator_start(
+                        &static_for_sender,
+                        &route.peer.public_key,
+                        &route.peer.psk,
+                    );
+                    let (msg1, state) = handshake.into_parts();
+                    sessions_for_sender.store_pending_init(&route.peer.name, state);
+                    let endpoint =
+                        resolve_endpoint(&state_for_sender, &route.peer.name, route.peer.endpoint);
+                    // Wrap msg1 in a HushWire handshake packet (encrypted with PSK).
+                    let hs_packet = auth::encode_packet(
+                        &msg1,
+                        &route.peer.psk,
+                        auth::MsgType::HandshakeInit,
+                        &[0u8; auth::SESSION_ID_SIZE],
+                    );
+                    if let Err(e) = transport_writer.send_to(&hs_packet, endpoint) {
+                        warn!(%e, peer = %route.peer.name, "failed to send handshake init");
+                    }
+                    debug!(peer = %route.peer.name, "initiated handshake, dropping data packet until session established");
+                    continue;
+                }
+            };
+
+            let encoded = auth::encode_packet(frame, &send_key, auth::MsgType::Data, &session_id);
             let endpoint =
                 resolve_endpoint(&state_for_sender, &route.peer.name, route.peer.endpoint);
             if let Err(error) = transport_writer.send_to(&encoded, endpoint) {
@@ -188,26 +309,138 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             let source = received.source;
             let frame = &packet[..size];
 
-            // Authenticate against all configured peers.
-            let (peer_name, nonce, msg_type, payload) = match decode_from_peers(
-                frame,
-                &router_for_receiver,
-            ) {
-                Some(result) => result,
+            // First, peek at msg_type to decide how to handle.
+            if frame.len() < 2 || frame[0] != 0x02 {
+                continue;
+            }
+            let msg_type = match auth::MsgType::from_u8(frame[1]) {
+                Some(mt) => mt,
+                None => continue,
+            };
+
+            // For handshake messages: decrypt with PSK (try each peer).
+            // For data/keepalive: extract session_id, look up session, decrypt with session key.
+            if msg_type.is_handshake() {
+                let (peer_name, payload) = match decode_handshake_from_peers(
+                    frame,
+                    &router_for_receiver,
+                ) {
+                    Some(r) => r,
+                    None => {
+                        warn!(source = %source, bytes = size, "dropping unauthenticated handshake packet");
+                        continue;
+                    }
+                };
+
+                match msg_type {
+                    auth::MsgType::HandshakeInit => {
+                        // We are the responder. Find this peer's config to get PSK + our static key.
+                        let route = router_for_receiver
+                            .routes()
+                            .iter()
+                            .find(|r| r.peer.name == peer_name);
+                        let Some(route) = route else {
+                            continue;
+                        };
+                        let hs = noise::responder_respond(
+                            &static_for_receiver,
+                            &route.peer.psk,
+                            &payload,
+                        );
+                        if let Some(hs) = hs {
+                            // Store the new session.
+                            sessions_for_receiver.store(&peer_name, hs.session);
+                            // Reset replay filter for this peer (new session = new nonce space).
+                            replay.insert(peer_name.clone(), replay::ReplayFilter::new());
+                            // Send msg2 back.
+                            let hs_packet = auth::encode_packet(
+                                &hs.message,
+                                &route.peer.psk,
+                                auth::MsgType::HandshakeResponse,
+                                &[0u8; auth::SESSION_ID_SIZE],
+                            );
+                            let endpoint = resolve_endpoint(
+                                &state_for_receiver,
+                                &peer_name,
+                                route.peer.endpoint,
+                            );
+                            if let Err(e) = transport.send_to(&hs_packet, endpoint) {
+                                warn!(%e, peer = %peer_name, "failed to send handshake response");
+                            }
+                            info!(peer = %peer_name, source = %source, "handshake completed (responder), session established");
+                        }
+                    }
+                    auth::MsgType::HandshakeResponse => {
+                        // We are the initiator completing the handshake.
+                        let route = router_for_receiver
+                            .routes()
+                            .iter()
+                            .find(|r| r.peer.name == peer_name);
+                        let Some(route) = route else {
+                            continue;
+                        };
+                        // Take the pending initiator state (created by sender thread).
+                        let Some(pending) = sessions_for_receiver.take_pending_init(&peer_name)
+                        else {
+                            debug!(peer = %peer_name, "handshake response without pending init, ignoring");
+                            continue;
+                        };
+                        let session = noise::initiator_finalize(
+                            pending,
+                            &static_for_receiver,
+                            &route.peer.public_key,
+                            &payload,
+                        );
+                        if let Some(session) = session {
+                            sessions_for_receiver.store(&peer_name, session);
+                            replay.insert(peer_name.clone(), replay::ReplayFilter::new());
+                            info!(peer = %peer_name, source = %source, "handshake completed (initiator), session established");
+                        } else {
+                            warn!(peer = %peer_name, "handshake finalization failed");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                state_for_receiver.record_keepalive(&peer_name, source);
+                continue;
+            }
+
+            // Data or Keepalive: extract session_id, find session, decrypt with session key.
+            let session_id = match auth::extract_session_id(frame) {
+                Some(sid) => sid,
+                None => continue,
+            };
+            let (recv_key, peer_name) =
+                match sessions_for_receiver.get_recv_key_by_session_id(&session_id) {
+                    Some(r) => r,
+                    None => {
+                        // No session for this session_id — might be a stale packet or
+                        // we haven't completed handshake yet. Drop silently.
+                        debug!(source = %source, "no session for session_id, dropping");
+                        continue;
+                    }
+                };
+
+            let (decoded_msg_type, payload) = match auth::decode_packet(frame, &recv_key) {
+                Some(r) => r,
                 None => {
-                    warn!(source = %source, bytes = size, "dropping unauthenticated transport packet");
+                    warn!(source = %source, peer = %peer_name, "failed to decrypt data packet with session key");
                     continue;
                 }
             };
 
-            // Reject replays before touching peer state or the TUN device.
+            // Extract nonce for replay filtering.
+            let mut nonce = [0u8; auth::NONCE_SIZE];
+            nonce.copy_from_slice(&frame[auth::SESSION_ID_OFFSET..auth::HEADER_SIZE]);
+
+            // Reject replays.
             let filter = replay.entry(peer_name.clone()).or_default();
             if !filter.check_and_insert(&nonce) {
                 warn!(source = %source, peer = %peer_name, "dropping replayed packet");
                 continue;
             }
 
-            match msg_type {
+            match decoded_msg_type {
                 auth::MsgType::Keepalive => {
                     state_for_receiver.record_keepalive(&peer_name, source);
                     continue;
@@ -215,6 +448,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 auth::MsgType::Data => {
                     state_for_receiver.record_rx(&peer_name, source, payload.len());
                 }
+                _ => continue, // handshake types already handled above
             }
 
             match Ipv4Packet::parse(&payload) {
@@ -254,8 +488,15 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 }
                 let sent = last_sent.entry(route.peer.name.clone()).or_insert(now);
                 if now.duration_since(*sent).as_secs() >= interval {
+                    // Use session key if available, otherwise skip (no session yet).
+                    let Some((send_key, session_id)) =
+                        sessions_for_keepalive.get_send_key(&route.peer.name)
+                    else {
+                        *sent = now;
+                        continue;
+                    };
                     let packet =
-                        auth::encode_packet(b"", &route.peer.psk, auth::MsgType::Keepalive);
+                        auth::encode_packet(b"", &send_key, auth::MsgType::Keepalive, &session_id);
                     let endpoint = resolve_endpoint(
                         &state_for_keepalive,
                         &route.peer.name,
@@ -378,18 +619,12 @@ fn add_packet_information<'a>(
     &output[..PACKET_INFO_SIZE + frame.len()]
 }
 
-/// Try to authenticate `frame` against any configured peer.
-/// On success returns the peer name, the packet nonce, the message type and the
-/// decoded payload.
-fn decode_from_peers(
-    frame: &[u8],
-    router: &Router,
-) -> Option<(String, [u8; auth::NONCE_SIZE], auth::MsgType, Vec<u8>)> {
+/// Try to authenticate a handshake `frame` against any configured peer (using PSK).
+/// Returns the peer name and the decrypted handshake payload.
+fn decode_handshake_from_peers(frame: &[u8], router: &Router) -> Option<(String, Vec<u8>)> {
     for route in router.routes() {
-        if let Some((msg_type, payload)) = auth::decode_packet(frame, &route.peer.psk) {
-            let mut nonce = [0u8; auth::NONCE_SIZE];
-            nonce.copy_from_slice(&frame[auth::NONCE_OFFSET..auth::HEADER_SIZE]);
-            return Some((route.peer.name.clone(), nonce, msg_type, payload));
+        if let Some((_msg_type, payload)) = auth::decode_packet(frame, &route.peer.psk) {
+            return Some((route.peer.name.clone(), payload));
         }
     }
     None

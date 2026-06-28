@@ -1,6 +1,6 @@
 # HushWire
 
-> **Status: experimental / alpha.** HushWire has not been audited. The crypto is a static pre-shared-key AEAD without a handshake, so there is no forward secrecy. Do not rely on it for sensitive traffic yet.
+> **Status: experimental.** HushWire has not been audited. The Noise handshake provides forward secrecy, but the implementation is new and untested in adversarial conditions. Do not rely on it for sensitive traffic yet.
 
 HushWire is an experimental WireGuard-like L3 tunnel focused on observability and debuggability.
 
@@ -23,16 +23,16 @@ sudo ./target/release/hushwire up -c my-node.toml
 ./target/release/hushwire doctor   -c my-node.toml
 ```
 
-The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching PSKs and swapped endpoints can ping each other's tunnel IPs once UDP port 27777 is reachable between them.
+The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching configs (exchanged public keys + shared PSK) can ping each other's tunnel IPs once UDP port 27777 is reachable between them.
 
 ## Overview
-
-The first milestone is intentionally small:
 
 - create a TUN interface
 - read IPv4 packets from it
 - route packets by longest-prefix match against peer `allowed_ips`
-- encrypt and authenticate each packet with ChaCha20-Poly1305 using a per-peer pre-shared key
+- **Noise_IKpsk2 handshake** with ephemeral keys → forward secrecy (PFS)
+- encrypt and authenticate each data packet with ChaCha20-Poly1305 using a session key
+- anti-replay protection per session
 - send packets over a pluggable packet transport, currently UDP
 - write received packets back into the TUN interface
 - emit structured events for route decisions and packet flow
@@ -41,21 +41,43 @@ The first milestone is intentionally small:
 
 ## Packet Security
 
-Each transport packet is encrypted and authenticated with ChaCha20-Poly1305 under a per-peer 32-byte pre-shared key (PSK). The on-wire layout is:
+HushWire uses a Noise_IKpsk2 handshake (same family as WireGuard) to negotiate ephemeral session keys. Data is encrypted with ChaCha20-Poly1305 under the session key, **not** the static PSK. This provides **forward secrecy**: even if the PSK or static private key is compromised later, previously captured traffic cannot be decrypted (session keys are ephemeral and destroyed after use).
+
+The PSK serves only as an authentication factor — it's mixed into the key derivation at the end of the handshake to verify both peers are authorized, but never directly encrypts data.
+
+### Key generation
+
+```sh
+hushwire genkey
+# PrivateKey = ...  (put in your [interface] section)
+# PublicKey  = ...  (give to your peer for their [[peer]] section)
+```
+
+### Handshake
+
+On-wire handshake (2 messages, 3 Diffie-Hellman operations):
+
+```text
+  Initiator                         Responder
+  msg1: eph_i_pub + PSK(static_i)   →
+                                   ←  msg2: eph_r_pub + PSK(session_id)
+  both derive: keys = HKDF(DH1 || DH2 || DH3 || psk)
+```
+
+### Data packet layout
 
 ```text
   offset  size  field
-  0       1     version   (0x02)
-  1       1     msg_type  (0x00 = data, 0x01 = keepalive)
-  2..13   12    nonce     (random)
-  13..    N     ciphertext + 16-byte Poly1305 tag
+  0       1     version    (0x02)
+  1       1     msg_type   (0x00=data, 0x01=keepalive, 0x02=handshake_init, 0x03=handshake_response)
+  2..10   8     session_id (identifies which session key to use)
+  10..14  4     nonce_rand (random, completes the 12-byte AEAD nonce)
+  14..    N     ciphertext + 16-byte Poly1305 tag
 ```
 
-`version || msg_type` is bound into the AEAD as additional authenticated data, so the header cannot be tampered with without failing decryption. The PSK is supplied base64-encoded in the peer config and validated at load time. This is symmetric pre-shared-key encryption, not a handshake: both peers must be configured with the same PSK.
+`version || msg_type` is bound into the AEAD as additional authenticated data, so the header cannot be tampered with without failing decryption. The 12-byte AEAD nonce = `session_id(8) || nonce_rand(4)`. The receiver uses `session_id` to look up the correct session key, then decrypts.
 
-Each peer also keeps a bounded FIFO of recently seen nonces (default 4096 entries) and drops any packet whose nonce has already been seen, so a captured ciphertext cannot be replayed. Because the nonces are random 96-bit values rather than a monotonic counter, the window is a set rather than a counter sliding window: a nonce older than 4096 packets ago is no longer tracked and would theoretically be replayable, the same bounded-window trade-off other tunnel implementations make. Fresh nonces collide inside the window with negligible (~2^-48) probability, so legitimate packets are effectively never misjudged as replays.
-
-Noise-based key exchange (per-peer session keys without sharing a PSK) is a future milestone.
+Each peer keeps a bounded FIFO of recently seen nonces per session (default 4096 entries) and drops any packet whose nonce has already been seen, so a captured ciphertext cannot be replayed. The replay filter is reset when a new session is established (rekey). Fresh nonces collide inside the window with negligible (~2^-48) probability.
 
 ## Transport Strategy
 

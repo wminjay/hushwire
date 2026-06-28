@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod doctor;
 mod firewall;
+mod noise;
 mod packet;
 mod replay;
 mod router;
@@ -69,6 +70,9 @@ enum Command {
         #[arg(long)]
         exit_node: bool,
     },
+    /// Generate a new static key pair for the Noise handshake.
+    /// Prints the private key (for your config) and public key (for your peer's config).
+    Genkey,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -124,9 +128,30 @@ fn main() -> anyhow::Result<()> {
             let config = Config::load(&config)?;
             tunnel::run(config, exit_node).context("tunnel stopped")?;
         }
+        Command::Genkey => {
+            genkey();
+        }
     }
 
     Ok(())
+}
+
+fn genkey() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let mut secret_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut secret_bytes);
+    let secret = StaticSecret::from(secret_bytes);
+    let public = PublicKey::from(&secret);
+
+    println!("PrivateKey = {}", STANDARD.encode(secret.to_bytes()));
+    println!("PublicKey  = {}", STANDARD.encode(public.as_bytes()));
+    println!();
+    println!("# Put PrivateKey in your [interface] section.");
+    println!("# Put the peer's PublicKey in their [[peer]] section.");
 }
 
 fn explain_route(config: &Config, router: &Router, destination: Ipv4Addr) {

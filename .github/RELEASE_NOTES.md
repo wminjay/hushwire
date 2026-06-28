@@ -1,10 +1,10 @@
 # Release Notes
 
-> ⚠️ **Alpha / experimental.** Not audited. Static PSK (no handshake, no forward secrecy).
+> ⚠️ **Experimental.** Not audited. Noise handshake provides forward secrecy, but implementation is new.
 
 ## What is HushWire
 
-A WireGuard-like L3 tunnel focused on observability and debuggability. ChaCha20-Poly1305 encrypted, anti-replay protected, with pluggable transport and exit-node support.
+A WireGuard-like L3 tunnel focused on observability and debuggability. Noise_IKpsk2 handshake with forward secrecy, ChaCha20-Poly1305 encrypted, anti-replay protected, with pluggable transport and exit-node support.
 
 ## Download
 
@@ -22,16 +22,18 @@ Each `.tar.gz` has a matching `.sha256` checksum.
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
+./hushwire genkey          # generate a static key pair (PrivateKey + PublicKey)
 openssl rand -base64 32    # generate a PSK, use same value on both peers
 sudo ./hushwire up -c my-node.toml
 ```
 
 See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for configuration details.
 
-## What works (v0.2.0)
+## What works (v0.3.0)
 
-- **ChaCha20-Poly1305 AEAD** packet encryption with per-peer 32-byte PSK
-- **Anti-replay protection** — bounded FIFO nonce window (4096 entries)
+- **Noise_IKpsk2 handshake** — ephemeral key exchange with forward secrecy (PFS)
+- **ChaCha20-Poly1305 AEAD** data encryption with session keys (not PSK)
+- **Anti-replay protection** — bounded FIFO nonce window per session (4096 entries)
 - **Endpoint roaming** — peers behind NAT connect by sending keepalives; the server learns their real address and replies there (same technique as WireGuard)
 - **IPv4 routing** by longest-prefix match
 - **UDP transport** (pluggable via `PacketTransport` trait)
@@ -50,7 +52,6 @@ See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for co
 
 ## Known limitations
 
-- **No key exchange** — static PSK only, no forward secrecy. Noise-based handshake planned.
 - **UDP only** — TCP/TLS transports not yet implemented.
 - **Linux-focused** — macOS works as a peer but exit-node NAT is Linux-only.
 - **Not audited** — experimental project.
