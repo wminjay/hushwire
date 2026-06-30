@@ -8,6 +8,7 @@ mod packet;
 mod router;
 mod routing;
 mod state;
+mod tcp_transport;
 mod transport;
 mod tunnel;
 

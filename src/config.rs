@@ -33,6 +33,7 @@ pub struct InterfaceConfig {
 pub enum TransportConfig {
     #[default]
     Udp,
+    Tcp,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -21,6 +21,7 @@ pub trait PacketTransport: Send + Sync + 'static {
 pub fn bind(config: &Config) -> anyhow::Result<Box<dyn PacketTransport>> {
     match config.interface.transport {
         TransportConfig::Udp => UdpTransport::bind(config.interface.listen),
+        TransportConfig::Tcp => crate::tcp_transport::TcpTransport::bind(config.interface.listen),
     }
 }
 
