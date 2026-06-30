@@ -23,7 +23,7 @@ sudo ./target/release/hushwire up -c my-node.toml
 ./target/release/hushwire doctor   -c my-node.toml
 ```
 
-The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching configs (exchanged public keys + shared PSK) can ping each other's tunnel IPs once UDP port 27777 is reachable between them.
+The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching configs (exchanged public keys + shared PSK) can ping each other's tunnel IPs once the transport port is reachable between them.
 
 ## Overview
 
@@ -33,7 +33,7 @@ The daemon creates a TUN interface, installs host routes, and tears everything d
 - **Noise_IKpsk2 handshake** with ephemeral keys → forward secrecy (PFS)
 - encrypt and authenticate each data packet with ChaCha20-Poly1305 using a session key
 - anti-replay protection per session
-- send packets over a pluggable packet transport, currently UDP
+- send packets over a pluggable packet transport (UDP or TCP)
 - write received packets back into the TUN interface
 - emit structured events for route decisions and packet flow
 - install host routes for the tunnel and tear them down on shutdown
@@ -83,9 +83,11 @@ Each peer keeps a bounded FIFO of recently seen nonces per session (default 4096
 
 UDP is the default data plane because it avoids TCP-over-TCP head-of-line blocking when the tunnel carries TCP traffic.
 
-- `udp` — **implemented.** Default low-latency packet transport.
-- `tcp` — **planned.** Compatibility fallback for networks that only allow TCP egress. Will require length-prefix framing on top of the byte stream.
+- `udp` — **default.** Low-latency packet transport.
+- `tcp` — **implemented.** Fallback for networks that block or QoS UDP. Uses 2-byte length-prefix framing on the TCP byte stream. Both sides listen; dialer connects on first send (symmetric, no listener/dialer role in config). `TCP_NODELAY` is set to avoid latency from Nagle's algorithm.
 - `tls` — **under consideration.** Would provide certificate-based peer authentication; note that HushWire already encrypts every packet with ChaCha20-Poly1305, so TLS would be used for identity rather than confidentiality.
+
+Configure with `transport = "tcp"` or `transport = "udp"` in the `[interface]` section.
 
 `faketcp` and `websocket` transports were considered and dropped: they add significant complexity without fitting HushWire's goal of being an observable, debuggable tunnel. The `PacketTransport` trait is designed so a new transport can be added without touching the data path.
 
