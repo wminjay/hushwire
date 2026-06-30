@@ -33,6 +33,13 @@ impl ConnState {
             .set_nonblocking(true)
             .context("failed to set nonblocking")
             .ok();
+        // Disable Nagle's algorithm — we want low latency for tunnel packets,
+        // and TCP_NODELAY ensures small handshake/data frames are sent immediately
+        // rather than being batched by the kernel.
+        stream
+            .set_nodelay(true)
+            .context("failed to set TCP_NODELAY")
+            .ok();
         Self {
             stream,
             read_buf: Vec::new(),
@@ -122,6 +129,7 @@ impl TcpTransport {
         thread::spawn(move || loop {
             match listener_for_accept.accept() {
                 Ok((stream, addr)) => {
+                    tracing::debug!(%addr, "TCP accept: new inbound connection");
                     let state = ConnState::new(stream);
                     conns_for_accept
                         .lock()
@@ -148,26 +156,43 @@ impl TcpTransport {
     }
 
     /// Get an existing connection or dial a new one.
+    ///
+    /// Uses a short connect timeout (2s) so that an unreachable endpoint
+    /// doesn't block the calling thread for minutes (TCP default SYN timeout).
     fn get_or_dial(&self, endpoint: SocketAddr) -> io::Result<Arc<Mutex<ConnState>>> {
         // Fast path: connection exists.
         if let Some(conn) = self.connections.lock().unwrap().get(&endpoint) {
             return Ok(Arc::clone(conn));
         }
-        // Slow path: dial.
-        let stream = TcpStream::connect(endpoint)?;
-        let state = ConnState::new(stream);
-        let arc = Arc::new(Mutex::new(state));
-        self.connections
-            .lock()
-            .unwrap()
-            .insert(endpoint, Arc::clone(&arc));
-        Ok(arc)
+        // Slow path: dial with timeout.
+        let addrs = std::net::ToSocketAddrs::to_socket_addrs(&endpoint)?;
+        let mut last_err = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+                Ok(stream) => {
+                    let state = ConnState::new(stream);
+                    let arc = Arc::new(Mutex::new(state));
+                    self.connections
+                        .lock()
+                        .unwrap()
+                        .insert(endpoint, Arc::clone(&arc));
+                    return Ok(arc);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(ErrorKind::AddrNotAvailable, "no addresses to connect to")
+        }))
     }
 }
 
 impl PacketTransport for TcpTransport {
     fn send_to(&self, frame: &[u8], endpoint: SocketAddr) -> io::Result<usize> {
-        let conn = self.get_or_dial(endpoint)?;
+        let conn = self.get_or_dial(endpoint).map_err(|e| {
+            tracing::warn!(%endpoint, error = %e, "TCP send_to: get_or_dial failed");
+            e
+        })?;
         let mut c = conn
             .lock()
             .map_err(|_| io::Error::other("connection mutex poisoned"))?;
@@ -280,5 +305,52 @@ mod tests {
         let f2 = state2.try_read_frame().unwrap();
         assert_eq!(f1, Some(b"first".to_vec()));
         assert_eq!(f2, Some(b"second".to_vec()));
+    }
+
+    /// End-to-end test: two TcpTransport instances on loopback, one sends,
+    /// the other receives. This mirrors the real tunnel.rs usage pattern.
+    #[test]
+    fn tcp_transport_e2e_send_recv() {
+        let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = TcpTransport::bind(server_addr).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let client = TcpTransport::bind(client_addr).unwrap();
+
+        // Client sends to server.
+        let payload = b"hello over tcp transport";
+        client.send_to(payload, server_addr).unwrap();
+
+        // Server receives. Give the connection + data time to arrive.
+        let mut buf = vec![0u8; 1024];
+        let received = loop {
+            match server.recv_from(&mut buf) {
+                Ok(pkt) => break pkt,
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        assert_eq!(&buf[..received.bytes], payload);
+    }
+
+    /// Bidirectional: both sides send and receive.
+    #[test]
+    fn tcp_transport_e2e_bidirectional() {
+        let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let server = TcpTransport::bind(server_addr).unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let client = TcpTransport::bind(client_addr).unwrap();
+
+        // Client → Server
+        client.send_to(b"c2s", server_addr).unwrap();
+        let mut buf = vec![0u8; 1024];
+        let pkt = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..pkt.bytes], b"c2s");
+
+        // Server → Client (server now knows client's addr from the connection)
+        server.send_to(b"s2c", pkt.source).unwrap();
+        let pkt2 = client.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..pkt2.bytes], b"s2c");
     }
 }
