@@ -359,12 +359,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                                 auth::MsgType::HandshakeResponse,
                                 &[0u8; auth::SESSION_ID_SIZE],
                             );
-                            let endpoint = resolve_endpoint(
-                                &state_for_receiver,
-                                &peer_name,
-                                route.peer.endpoint,
-                            );
-                            if let Err(e) = transport.send_to(&hs_packet, endpoint) {
+                            if let Err(e) = transport.send_to(&hs_packet, source) {
                                 warn!(%e, peer = %peer_name, "failed to send handshake response");
                             }
                             info!(peer = %peer_name, source = %source, "handshake completed (responder), session established");
