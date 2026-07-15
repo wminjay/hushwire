@@ -22,6 +22,7 @@ Each `.tar.gz` has a matching `.sha256` checksum.
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
+./hushwire --version       # prints: hushwire 0.4.1
 ./hushwire genkey          # generate a static key pair (PrivateKey + PublicKey)
 openssl rand -base64 32    # generate a PSK, use same value on both peers
 sudo ./hushwire up -c my-node.toml
@@ -29,7 +30,25 @@ sudo ./hushwire up -c my-node.toml
 
 See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for configuration details.
 
-## What works (v0.4.0)
+## What's new in v0.4.1
+
+- **UDP NAT self-healing** — authenticated keepalive probes detect a broken return path and optionally rebind the client to a fresh ephemeral source port.
+- **Safe multi-peer rebinding** — after the interface-wide UDP socket changes, every active peer receives a one-shot authenticated notification, including peers with periodic keepalives disabled.
+- **NAT diagnostics** — authenticated endpoint changes and UDP rebind recovery events are clearly logged.
+- **Ephemeral client ports** — `listen = "0.0.0.0:0"` is documented for clients that do not require a fixed inbound port.
+- **CLI version output** — `hushwire --version` and `hushwire -V` report `hushwire 0.4.1`.
+
+To enable automatic recovery on a NATed UDP client:
+
+```toml
+[[peer]]
+persistent_keepalive = 25
+udp_rebind_after = 90
+```
+
+The public exit only needs the v0.4.1 binary so it can acknowledge probes; configure `udp_rebind_after` on the NATed client, not the exit.
+
+## What works (v0.4.1)
 
 - **Noise_IKpsk2 handshake** — ephemeral key exchange with forward secrecy (PFS)
 - **ChaCha20-Poly1305 AEAD** data encryption with session keys (not PSK)
@@ -41,7 +60,7 @@ See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for co
 - **Automatic route management** — host routes, full-tunnel split routing, endpoint exception, all torn down on shutdown
 - **Exit-node NAT** — `--exit-node` installs iptables MASQUERADE + ip_forward, restored on shutdown
 - **Persistent keepalive** and **structured peer stats** logging
-- **CLI**: `check`, `route`, `explain`, `plan-routes`, `doctor`, `up`, `genkey`
+- **CLI**: `check`, `route`, `explain`, `plan-routes`, `doctor`, `up`, `genkey`, `--help`, `--version`
 
 ## Tested in practice
 
@@ -54,4 +73,5 @@ See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for co
 ## Known limitations
 
 - **Linux-focused** — macOS works as a peer but exit-node NAT is Linux-only.
+- **UDP auto-rebind requires v0.4.1 on both peers** — older peers accept probe keepalives but do not acknowledge them.
 - **Not audited** — experimental project.
