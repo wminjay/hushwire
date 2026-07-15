@@ -25,6 +25,7 @@ use crate::router::Router;
 #[derive(Debug, Parser)]
 #[command(name = "hushwire")]
 #[command(about = "A debuggable WireGuard-like L3 tunnel")]
+#[command(version)]
 struct Cli {
     #[arg(long, global = true, default_value = "text")]
     log_format: LogFormat,
