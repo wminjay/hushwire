@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -169,6 +169,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             endpoint = %route.peer.endpoint,
             prefix = %route.prefix,
             keepalive = route.peer.persistent_keepalive,
+            udp_rebind_after = route.peer.udp_rebind_after,
             "route installed"
         );
     }
@@ -438,6 +439,31 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             match decoded_msg_type {
                 auth::MsgType::Keepalive => {
                     state_for_receiver.record_keepalive(&peer_name, source);
+                    if payload == auth::KEEPALIVE_PROBE_PAYLOAD {
+                        let Some((send_key, session_id)) =
+                            sessions_for_receiver.get_send_key(&peer_name)
+                        else {
+                            debug!(peer = %peer_name, "cannot acknowledge keepalive probe without an active send session");
+                            continue;
+                        };
+                        let acknowledgement = auth::encode_packet(
+                            auth::KEEPALIVE_ACK_PAYLOAD,
+                            &send_key,
+                            auth::MsgType::Keepalive,
+                            &session_id,
+                        );
+                        match transport.send_to(&acknowledgement, source) {
+                            Ok(_) => {
+                                state_for_receiver.record_tx(&peer_name, acknowledgement.len());
+                                debug!(peer = %peer_name, endpoint = %source, "acknowledged keepalive probe");
+                            }
+                            Err(error) => {
+                                warn!(%error, peer = %peer_name, endpoint = %source, "failed to acknowledge keepalive probe");
+                            }
+                        }
+                    } else if !payload.is_empty() && payload != auth::KEEPALIVE_ACK_PAYLOAD {
+                        debug!(peer = %peer_name, bytes = payload.len(), "ignored unknown keepalive payload");
+                    }
                     continue;
                 }
                 auth::MsgType::Data => {
@@ -473,35 +499,114 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
 
     let keepalive = thread::spawn(move || {
         let mut last_sent: HashMap<String, Instant> = HashMap::new();
+        let mut last_rebind_attempt: Option<Instant> = None;
         loop {
             thread::sleep(Duration::from_secs(1));
             let now = Instant::now();
+            let snapshot = state_for_keepalive.snapshot();
+            let mut checked_peers = HashSet::new();
+            let mut rebound = false;
+
+            // Active probes turn last_seen into a bidirectional health signal.
+            // If an opted-in peer remains silent beyond its threshold, change
+            // the local UDP source port so broken NAT state cannot follow us.
             for route in router_for_keepalive.routes() {
-                let interval = route.peer.persistent_keepalive as u64;
-                if interval == 0 {
+                if route.peer.udp_rebind_after == 0
+                    || !checked_peers.insert(route.peer.name.clone())
+                    || !last_sent.contains_key(&route.peer.name)
+                    || sessions_for_keepalive
+                        .get_send_key(&route.peer.name)
+                        .is_none()
+                {
                     continue;
                 }
-                let sent = last_sent.entry(route.peer.name.clone()).or_insert(now);
-                if now.duration_since(*sent).as_secs() >= interval {
-                    // Use session key if available, otherwise skip (no session yet).
-                    let Some((send_key, session_id)) =
-                        sessions_for_keepalive.get_send_key(&route.peer.name)
-                    else {
-                        *sent = now;
-                        continue;
-                    };
-                    let packet =
-                        auth::encode_packet(b"", &send_key, auth::MsgType::Keepalive, &session_id);
-                    let endpoint = resolve_endpoint(
-                        &state_for_keepalive,
-                        &route.peer.name,
-                        route.peer.endpoint,
-                    );
-                    if keepalive_transport.send_to(&packet, endpoint).is_ok() {
-                        state_for_keepalive.record_tx(&route.peer.name, packet.len());
-                    }
-                    *sent = now;
+
+                let Some(stats) = snapshot.get(&route.peer.name) else {
+                    continue;
+                };
+                let Some(last_seen) = stats.last_seen else {
+                    continue;
+                };
+                if !udp_rebind_due(
+                    now,
+                    last_seen,
+                    last_rebind_attempt,
+                    Duration::from_secs(route.peer.udp_rebind_after as u64),
+                ) {
+                    continue;
                 }
+
+                last_rebind_attempt = Some(now);
+                match keepalive_transport.rebind_to_ephemeral() {
+                    Ok(Some(result)) => {
+                        warn!(
+                            peer = %route.peer.name,
+                            silence_seconds = now.duration_since(last_seen).as_secs(),
+                            previous_listen = %result.previous,
+                            current_listen = %result.current,
+                            "no authenticated keepalive response; rebound UDP socket to recover the NAT path"
+                        );
+                        rebound = true;
+                    }
+                    Ok(None) => {
+                        error!(peer = %route.peer.name, "configured UDP rebind is unsupported by the active transport");
+                    }
+                    Err(error) => {
+                        warn!(%error, peer = %route.peer.name, "failed to rebind UDP socket after peer liveness timeout");
+                    }
+                }
+                break;
+            }
+
+            // A rebind affects the interface-wide socket. Immediately notify
+            // every peer with an active session so learned endpoints roam to
+            // the fresh port, even if periodic keepalives are disabled there.
+            let mut sent_peers = HashSet::new();
+            for route in router_for_keepalive.routes() {
+                if !sent_peers.insert(route.peer.name.clone()) {
+                    continue;
+                }
+                let interval = Duration::from_secs(route.peer.persistent_keepalive as u64);
+                let should_send = keepalive_should_send(
+                    now,
+                    last_sent.get(&route.peer.name).copied(),
+                    interval,
+                    route.peer.udp_rebind_after > 0,
+                    rebound,
+                );
+                if !should_send {
+                    if !interval.is_zero() {
+                        last_sent.entry(route.peer.name.clone()).or_insert(now);
+                    }
+                    continue;
+                }
+
+                // Use the session key if available; cold-start handshakes are
+                // still initiated by real TUN traffic.
+                let Some((send_key, session_id)) =
+                    sessions_for_keepalive.get_send_key(&route.peer.name)
+                else {
+                    if route.peer.udp_rebind_after == 0 {
+                        last_sent.insert(route.peer.name.clone(), now);
+                    }
+                    continue;
+                };
+                let payload = if route.peer.udp_rebind_after > 0 {
+                    auth::KEEPALIVE_PROBE_PAYLOAD
+                } else {
+                    b""
+                };
+                let packet =
+                    auth::encode_packet(payload, &send_key, auth::MsgType::Keepalive, &session_id);
+                let endpoint =
+                    resolve_endpoint(&state_for_keepalive, &route.peer.name, route.peer.endpoint);
+                match keepalive_transport.send_to(&packet, endpoint) {
+                    Ok(_) => state_for_keepalive.record_tx(&route.peer.name, packet.len()),
+                    Err(error) => {
+                        warn!(%error, peer = %route.peer.name, endpoint = %endpoint, "failed to send keepalive");
+                    }
+                }
+                last_sent.insert(route.peer.name.clone(), now);
             }
         }
     });
@@ -560,6 +665,40 @@ fn resolve_endpoint(state: &PeerState, peer_name: &str, configured: SocketAddr) 
         .and_then(|stats| stats.current_endpoint)
         .filter(|learned| *learned != configured)
         .unwrap_or(configured)
+}
+
+fn udp_rebind_due(
+    now: Instant,
+    last_seen: Instant,
+    last_rebind_attempt: Option<Instant>,
+    timeout: Duration,
+) -> bool {
+    let health_baseline = last_rebind_attempt
+        .map(|attempt| attempt.max(last_seen))
+        .unwrap_or(last_seen);
+    now.saturating_duration_since(health_baseline) >= timeout
+}
+
+fn keepalive_should_send(
+    now: Instant,
+    last_sent: Option<Instant>,
+    interval: Duration,
+    recovery_enabled: bool,
+    rebound: bool,
+) -> bool {
+    if rebound {
+        // Rebinding changes the interface-wide source port, so even peers with
+        // periodic keepalives disabled need a one-shot authenticated packet.
+        return true;
+    }
+    if interval.is_zero() {
+        return false;
+    }
+    last_sent
+        .map(|sent| now.saturating_duration_since(sent) >= interval)
+        // Recovery-enabled peers probe as soon as their session becomes
+        // available, establishing a health baseline.
+        .unwrap_or(recovery_enabled)
 }
 
 fn create_tun(config: &Config) -> anyhow::Result<TunDevice> {
@@ -639,5 +778,70 @@ impl Cleanup {
         if let Some(ref f) = *fw {
             f.cleanup();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_rebind_becomes_due_after_inbound_silence() {
+        let now = Instant::now();
+        let last_seen = now.checked_sub(Duration::from_secs(91)).unwrap();
+        assert!(udp_rebind_due(
+            now,
+            last_seen,
+            None,
+            Duration::from_secs(90)
+        ));
+    }
+
+    #[test]
+    fn recent_inbound_packet_cancels_rebind() {
+        let now = Instant::now();
+        let last_seen = now.checked_sub(Duration::from_secs(5)).unwrap();
+        let old_attempt = now.checked_sub(Duration::from_secs(120));
+        assert!(!udp_rebind_due(
+            now,
+            last_seen,
+            old_attempt,
+            Duration::from_secs(90)
+        ));
+    }
+
+    #[test]
+    fn failed_rebind_attempt_is_rate_limited() {
+        let now = Instant::now();
+        let last_seen = now.checked_sub(Duration::from_secs(180)).unwrap();
+        let recent_attempt = now.checked_sub(Duration::from_secs(5));
+        assert!(!udp_rebind_due(
+            now,
+            last_seen,
+            recent_attempt,
+            Duration::from_secs(90)
+        ));
+    }
+
+    #[test]
+    fn rebind_notifies_peer_with_periodic_keepalive_disabled() {
+        assert!(keepalive_should_send(
+            Instant::now(),
+            None,
+            Duration::ZERO,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn peer_without_keepalive_stays_silent_without_rebind() {
+        assert!(!keepalive_should_send(
+            Instant::now(),
+            None,
+            Duration::ZERO,
+            false,
+            false
+        ));
     }
 }

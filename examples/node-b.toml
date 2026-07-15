@@ -13,3 +13,6 @@ allowed_ips = ["10.77.0.1/32"]
 psk = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
 public_key = "Xynrith/BOMMekRk30uyCjhasVMuXPj3cd00dBYujQg="
 persistent_keepalive = 25
+# Optional for NATed UDP clients: rebind to a fresh source port after
+# authenticated replies have been silent for this many seconds.
+# udp_rebind_after = 90

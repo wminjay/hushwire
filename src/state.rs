@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, info};
 
 /// Runtime statistics for a single peer.
 #[derive(Debug, Clone, Default)]
@@ -36,18 +36,32 @@ impl PeerState {
         let entry = map.entry(peer_name.to_string()).or_default();
         entry.rx_bytes += bytes as u64;
         entry.last_seen = Some(Instant::now());
-        entry.current_endpoint = Some(source);
+        update_endpoint(peer_name, entry, source);
     }
 
     pub fn record_keepalive(&self, peer_name: &str, source: SocketAddr) {
         let mut map = self.inner.lock().unwrap();
         let entry = map.entry(peer_name.to_string()).or_default();
         entry.last_seen = Some(Instant::now());
-        entry.current_endpoint = Some(source);
+        update_endpoint(peer_name, entry, source);
         debug!(peer = %peer_name, source = %source, "received keepalive");
     }
 
     pub fn snapshot(&self) -> HashMap<String, PeerStats> {
         self.inner.lock().unwrap().clone()
     }
+}
+
+fn update_endpoint(peer_name: &str, stats: &mut PeerStats, source: SocketAddr) {
+    if let Some(previous) = stats.current_endpoint {
+        if previous != source {
+            info!(
+                peer = %peer_name,
+                previous = %previous,
+                current = %source,
+                "authenticated peer endpoint changed"
+            );
+        }
+    }
+    stats.current_endpoint = Some(source);
 }

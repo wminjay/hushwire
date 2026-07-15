@@ -113,6 +113,37 @@ fn keepalive_round_trip_after_handshake() {
 }
 
 #[test]
+fn authenticated_keepalive_probe_gets_an_authenticated_ack() {
+    let (i_static, _) = gen_keypair();
+    let (r_static, r_pub) = gen_keypair();
+    let psk = [0x42u8; 32];
+
+    let (i_session, r_session) = do_handshake(&i_static, &r_static, &r_pub, &psk);
+
+    let probe = auth::encode_packet(
+        auth::KEEPALIVE_PROBE_PAYLOAD,
+        &i_session.send_key,
+        MsgType::Keepalive,
+        &i_session.session_id,
+    );
+    let (probe_type, probe_payload) = auth::decode_packet(&probe, &r_session.recv_key)
+        .expect("responder should authenticate the probe");
+    assert_eq!(probe_type, MsgType::Keepalive);
+    assert_eq!(probe_payload, auth::KEEPALIVE_PROBE_PAYLOAD);
+
+    let acknowledgement = auth::encode_packet(
+        auth::KEEPALIVE_ACK_PAYLOAD,
+        &r_session.send_key,
+        MsgType::Keepalive,
+        &r_session.session_id,
+    );
+    let (ack_type, ack_payload) = auth::decode_packet(&acknowledgement, &i_session.recv_key)
+        .expect("initiator should authenticate the acknowledgement");
+    assert_eq!(ack_type, MsgType::Keepalive);
+    assert_eq!(ack_payload, auth::KEEPALIVE_ACK_PAYLOAD);
+}
+
+#[test]
 fn wrong_session_key_cannot_decrypt() {
     let (i_static, _) = gen_keypair();
     let (r_static, r_pub) = gen_keypair();

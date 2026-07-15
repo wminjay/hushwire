@@ -19,6 +19,8 @@ use rand::RngCore;
 /// The 12-byte AEAD nonce = session_id(8) || nonce_rand(4). For data packets,
 /// session_id lets the receiver look up which session key to use. For handshake
 /// messages, session_id is random (no session yet) and the PSK is the key.
+/// Keepalive plaintext is empty for legacy one-way keepalives, `0x01` for an
+/// active liveness probe, or `0x02` for its acknowledgement.
 pub const HEADER_SIZE: usize = 14;
 pub const TAG_SIZE: usize = 16;
 /// Legacy: size of a pre-shared key. Now an alias for KEY_SIZE; kept for
@@ -37,6 +39,11 @@ pub const SESSION_ID_OFFSET: usize = 2;
 pub const NONCE_RAND_OFFSET: usize = SESSION_ID_OFFSET + SESSION_ID_SIZE;
 /// Length of the AEAD nonce in bytes (session_id + nonce_rand = 8 + 4).
 pub const NONCE_SIZE: usize = SESSION_ID_SIZE + NONCE_RAND_SIZE;
+
+/// Authenticated keepalive payloads used for bidirectional UDP liveness.
+/// Empty payloads remain valid legacy keepalives and do not request a reply.
+pub const KEEPALIVE_PROBE_PAYLOAD: &[u8] = &[0x01];
+pub const KEEPALIVE_ACK_PAYLOAD: &[u8] = &[0x02];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsgType {
@@ -177,6 +184,19 @@ mod tests {
         let (msg_type, decoded) = decode_packet(&packet, &key).expect("valid packet");
         assert_eq!(msg_type, MsgType::Keepalive);
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn round_trip_keepalive_probe_and_ack() {
+        let key = test_key();
+        let sid = test_session_id();
+
+        for payload in [KEEPALIVE_PROBE_PAYLOAD, KEEPALIVE_ACK_PAYLOAD] {
+            let packet = encode_packet(payload, &key, MsgType::Keepalive, &sid);
+            let (msg_type, decoded) = decode_packet(&packet, &key).expect("valid packet");
+            assert_eq!(msg_type, MsgType::Keepalive);
+            assert_eq!(decoded, payload);
+        }
     }
 
     #[test]

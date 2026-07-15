@@ -48,6 +48,10 @@ pub struct PeerConfig {
     /// Persistent keepalive interval in seconds (0 = disabled).
     #[serde(default)]
     pub persistent_keepalive: u16,
+    /// Rebind the shared UDP socket to a fresh ephemeral port after this many
+    /// seconds without authenticated inbound traffic (0 = disabled).
+    #[serde(default)]
+    pub udp_rebind_after: u16,
 }
 
 #[derive(Debug, Error)]
@@ -72,6 +76,18 @@ pub enum ConfigError {
     InvalidPublicKey(String),
     #[error("interface has an invalid private_key: must be base64-encoded 32 bytes")]
     InvalidPrivateKey,
+    #[error("peer {0} sets udp_rebind_after, but the interface transport is not UDP")]
+    UdpRebindRequiresUdp(String),
+    #[error("peer {0} sets udp_rebind_after, but persistent_keepalive is disabled")]
+    UdpRebindRequiresKeepalive(String),
+    #[error(
+        "peer {peer} udp_rebind_after ({rebind_after}s) must be greater than persistent_keepalive ({keepalive}s)"
+    )]
+    UdpRebindTooSoon {
+        peer: String,
+        rebind_after: u16,
+        keepalive: u16,
+    },
 }
 
 impl Config {
@@ -111,6 +127,21 @@ impl Config {
             }
             if decode_key(&peer.public_key).is_none() {
                 return Err(ConfigError::InvalidPublicKey(peer.name.clone()));
+            }
+            if peer.udp_rebind_after > 0 {
+                if self.interface.transport != TransportConfig::Udp {
+                    return Err(ConfigError::UdpRebindRequiresUdp(peer.name.clone()));
+                }
+                if peer.persistent_keepalive == 0 {
+                    return Err(ConfigError::UdpRebindRequiresKeepalive(peer.name.clone()));
+                }
+                if peer.udp_rebind_after <= peer.persistent_keepalive {
+                    return Err(ConfigError::UdpRebindTooSoon {
+                        peer: peer.name.clone(),
+                        rebind_after: peer.udp_rebind_after,
+                        keepalive: peer.persistent_keepalive,
+                    });
+                }
             }
         }
 
@@ -167,6 +198,7 @@ mod tests {
             psk: VALID_PSK.to_string(),
             public_key: VALID_KEY.to_string(),
             persistent_keepalive: 0,
+            udp_rebind_after: 0,
         }
     }
 
@@ -282,6 +314,68 @@ mod tests {
             peer: vec![p],
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidPsk(_))));
+    }
+
+    #[test]
+    fn accepts_udp_rebind_with_keepalive() {
+        let mut p = peer("node-b");
+        p.persistent_keepalive = 25;
+        p.udp_rebind_after = 90;
+        let config = Config {
+            interface: interface(),
+            peer: vec![p],
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_udp_rebind_without_keepalive() {
+        let mut p = peer("node-b");
+        p.udp_rebind_after = 90;
+        let config = Config {
+            interface: interface(),
+            peer: vec![p],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UdpRebindRequiresKeepalive(name)) if name == "node-b"
+        ));
+    }
+
+    #[test]
+    fn rejects_udp_rebind_for_tcp() {
+        let mut p = peer("node-b");
+        p.persistent_keepalive = 25;
+        p.udp_rebind_after = 90;
+        let mut iface = interface();
+        iface.transport = TransportConfig::Tcp;
+        let config = Config {
+            interface: iface,
+            peer: vec![p],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UdpRebindRequiresUdp(name)) if name == "node-b"
+        ));
+    }
+
+    #[test]
+    fn rejects_udp_rebind_before_a_probe_can_run() {
+        let mut p = peer("node-b");
+        p.persistent_keepalive = 25;
+        p.udp_rebind_after = 25;
+        let config = Config {
+            interface: interface(),
+            peer: vec![p],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UdpRebindTooSoon {
+                rebind_after: 25,
+                keepalive: 25,
+                ..
+            })
+        ));
     }
 
     #[test]

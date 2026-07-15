@@ -15,6 +15,7 @@ pub struct Peer {
     /// Peer's static public key (x25519) for Noise handshake.
     pub public_key: PublicKey,
     pub persistent_keepalive: u16,
+    pub udp_rebind_after: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +86,7 @@ fn peer_from_config(config: &PeerConfig) -> Peer {
         psk: crate::config::decode_psk(&config.psk).expect("psk validated by Config::load"),
         public_key: PublicKey::from(public_key_bytes),
         persistent_keepalive: config.persistent_keepalive,
+        udp_rebind_after: config.udp_rebind_after,
     }
 }
 
@@ -223,6 +225,7 @@ mod tests {
             psk: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
+            udp_rebind_after: 0,
         }
     }
 
@@ -234,6 +237,7 @@ mod tests {
             psk: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
+            udp_rebind_after: 0,
         }
     }
 }

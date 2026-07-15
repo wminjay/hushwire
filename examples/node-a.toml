@@ -13,3 +13,6 @@ allowed_ips = ["10.77.0.2/32"]
 psk = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
 public_key = "fetuos8XUNQuWY6K3bw7D5Qz6Qn9wgqIqHUw5zPEMR0="
 persistent_keepalive = 25
+# Optional for NATed UDP clients: rebind to a fresh source port after
+# authenticated replies have been silent for this many seconds.
+# udp_rebind_after = 90

@@ -38,6 +38,7 @@ The daemon creates a TUN interface, installs host routes, and tears everything d
 - emit structured events for route decisions and packet flow
 - install host routes for the tunnel and tear them down on shutdown
 - optional persistent keepalive to keep NAT mappings alive
+- optional authenticated liveness probes and UDP port rebinding to recover a broken NAT path
 
 ## Packet Security
 
@@ -79,6 +80,8 @@ On-wire handshake (2 messages, 3 Diffie-Hellman operations):
 
 Each peer keeps a bounded FIFO of recently seen nonces per session (default 4096 entries) and drops any packet whose nonce has already been seen, so a captured ciphertext cannot be replayed. The replay filter is reset when a new session is established (rekey). Fresh nonces collide inside the window with negligible (~2^-48) probability.
 
+Keepalive packets use an empty encrypted payload for legacy one-way keepalives, `0x01` for an active liveness probe, and `0x02` for its acknowledgement.
+
 ## Transport Strategy
 
 UDP is the default data plane because it avoids TCP-over-TCP head-of-line blocking when the tunnel carries TCP traffic.
@@ -88,6 +91,35 @@ UDP is the default data plane because it avoids TCP-over-TCP head-of-line blocki
 - `tls` — **under consideration.** Would provide certificate-based peer authentication; note that HushWire already encrypts every packet with ChaCha20-Poly1305, so TLS would be used for identity rather than confidentiality.
 
 Configure with `transport = "tcp"` or `transport = "udp"` in the `[interface]` section.
+
+### UDP NAT resilience
+
+Multiple clients behind the same NAT should use unique local UDP listen ports. This is especially important behind double NAT, where some devices incorrectly collide or retain mappings when several clients use the same source port. A client that does not need a predictable inbound port can let the operating system choose one:
+
+```toml
+[interface]
+listen = "0.0.0.0:0"
+transport = "udp"
+```
+
+Port `0` is replaced with an ephemeral port at bind time and remains stable for the lifetime of the process. HushWire logs the actual bound address in the `tunnel started` event.
+
+For automatic recovery when an established UDP path becomes one-way, enable rebinding on the client-side peer:
+
+```toml
+[[peer]]
+name = "exit"
+endpoint = "203.0.113.20:27777"
+allowed_ips = ["0.0.0.0/0"]
+psk = "<base64-32-byte-psk>"
+public_key = "<base64-peer-public-key>"
+persistent_keepalive = 25
+udp_rebind_after = 90
+```
+
+With `udp_rebind_after` enabled, persistent keepalives become authenticated probes. The peer returns an authenticated acknowledgement, so the client can distinguish an idle tunnel from a broken return path. If no authenticated packet arrives for the configured number of seconds, HushWire binds a fresh ephemeral UDP source port and immediately sends a one-shot authenticated keepalive to every active peer—including peers with periodic keepalives disabled—so all learned endpoints move to the new port.
+
+`udp_rebind_after` is disabled by default and must be greater than `persistent_keepalive`. Enable it on NATed clients, not on a public exit node: rebinding changes the interface-wide UDP socket and therefore the source port used for every peer on that interface. Both ends must support probe acknowledgements; older peers accept the keepalive but do not reply. A cold start still needs real tunnel traffic to initiate the Noise handshake.
 
 `faketcp` and `websocket` transports were considered and dropped: they add significant complexity without fitting HushWire's goal of being an observable, debuggable tunnel. The `PacketTransport` trait is designed so a new transport can be added without touching the data path.
 
