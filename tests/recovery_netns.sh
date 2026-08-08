@@ -2,10 +2,24 @@
 
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <hushwire-binary>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "usage: $0 <hushwire-binary> [udp|tcp]" >&2
     exit 2
 fi
+
+transport=${2:-udp}
+case "$transport" in
+    udp)
+        client_recovery_config='udp_rebind_after = 3'
+        ;;
+    tcp)
+        client_recovery_config=$'udp_rebind_after = 0\nsession_timeout = 3'
+        ;;
+    *)
+        echo "unsupported transport: $transport" >&2
+        exit 2
+        ;;
+esac
 
 if [[ $(id -u) -ne 0 ]]; then
     echo "recovery_netns.sh must run as root" >&2
@@ -65,12 +79,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cat >"$test_directory/client.toml" <<'EOF'
+cat >"$test_directory/client.toml" <<EOF
 [interface]
 name = "hwtun-client"
 address = "10.77.2.2/30"
 listen = "0.0.0.0:0"
-transport = "udp"
+transport = "$transport"
 mtu = 1280
 private_key = "CggT/efhwLvXYkiKz1n7ZrMaynmTKsVt3iQgCdQNtwk="
 
@@ -81,15 +95,15 @@ allowed_ips = ["10.77.2.1/32"]
 psk = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
 public_key = "Xynrith/BOMMekRk30uyCjhasVMuXPj3cd00dBYujQg="
 persistent_keepalive = 1
-udp_rebind_after = 3
+$client_recovery_config
 EOF
 
-cat >"$test_directory/server.toml" <<'EOF'
+cat >"$test_directory/server.toml" <<EOF
 [interface]
 name = "hwtun-server"
 address = "10.77.2.1/30"
 listen = "0.0.0.0:27777"
-transport = "udp"
+transport = "$transport"
 mtu = 1280
 private_key = "+BKKM7yvO+68uCpscwMqDBOhTzs5tc1c/B1TgR9hnsc="
 
@@ -193,11 +207,15 @@ wait_for_ping "$client_namespace" 10.77.2.1
 kill -0 "$client_pid"
 
 grep -q "peer liveness timeout invalidated the old session" "$test_directory/client.log"
-grep -q "rebound UDP socket to recover the NAT path" "$test_directory/client.log"
+if [[ "$transport" == udp ]]; then
+    grep -q "rebound UDP socket to recover the NAT path" "$test_directory/client.log"
+else
+    grep -q "session recovery timeout reached" "$test_directory/client.log"
+fi
 if [[ $(grep -c "handshake completed (initiator)" "$test_directory/client.log") -lt 2 ]]; then
     echo "client did not complete a second initiator handshake" >&2
     exit 1
 fi
 grep -q "handshake completed (responder)" "$test_directory/server-2.log"
 
-echo "isolated recovery test passed: server restarted, client PID $client_pid survived, ping recovered"
+echo "isolated $transport recovery test passed: server restarted, client PID $client_pid survived, ping recovered"

@@ -103,6 +103,23 @@ UDP is the default data plane because it avoids TCP-over-TCP head-of-line blocki
 
 Configure with `transport = "tcp"` or `transport = "udp"` in the `[interface]` section.
 
+TCP peers with `persistent_keepalive` enabled also use authenticated probes for
+session recovery. If the peer stops responding, HushWire discards the stale
+Noise session and starts a fresh handshake over the re-established TCP stream.
+The default timeout is three keepalive intervals with a 15-second minimum. Set
+`session_timeout` explicitly to tune it, or set it to `0` to disable automatic
+TCP session recovery:
+
+```toml
+[[peer]]
+persistent_keepalive = 5
+session_timeout = 20
+```
+
+An explicit `session_timeout` must be greater than `persistent_keepalive`.
+It can also be used for UDP session-only recovery, but `udp_rebind_after` takes
+precedence when both are configured because rebinding also repairs the NAT path.
+
 ### UDP NAT resilience
 
 Multiple clients behind the same NAT should use unique local UDP listen ports. This is especially important behind double NAT, where some devices incorrectly collide or retain mappings when several clients use the same source port. A client that does not need a predictable inbound port can let the operating system choose one:

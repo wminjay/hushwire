@@ -52,6 +52,15 @@ pub struct PeerConfig {
     /// seconds without authenticated inbound traffic (0 = disabled).
     #[serde(default)]
     pub udp_rebind_after: u16,
+    /// Discard a stale cryptographic session and start a fresh handshake after
+    /// this many seconds without authenticated inbound traffic.
+    ///
+    /// `0` explicitly disables the timeout. When omitted, TCP peers with
+    /// persistent keepalives use an automatic timeout of three keepalive
+    /// intervals (with a 15-second minimum); UDP keeps its existing explicit
+    /// `udp_rebind_after` behavior.
+    #[serde(default)]
+    pub session_timeout: Option<u16>,
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +97,33 @@ pub enum ConfigError {
         rebind_after: u16,
         keepalive: u16,
     },
+    #[error("peer {0} sets session_timeout, but persistent_keepalive is disabled")]
+    SessionTimeoutRequiresKeepalive(String),
+    #[error(
+        "peer {peer} session_timeout ({timeout}s) must be greater than persistent_keepalive ({keepalive}s)"
+    )]
+    SessionTimeoutTooSoon {
+        peer: String,
+        timeout: u16,
+        keepalive: u16,
+    },
+}
+
+impl PeerConfig {
+    /// Effective transport-independent authenticated-session timeout.
+    ///
+    /// TCP needs a default because reconnecting its byte stream does not
+    /// recreate the Noise session that the remote process lost. An explicit
+    /// zero lets operators retain the old no-timeout behavior when desired.
+    pub fn effective_session_timeout(&self, transport: TransportConfig) -> u64 {
+        match self.session_timeout {
+            Some(timeout) => u64::from(timeout),
+            None if transport == TransportConfig::Tcp && self.persistent_keepalive > 0 => {
+                (u64::from(self.persistent_keepalive) * 3).max(15)
+            }
+            None => 0,
+        }
+    }
 }
 
 impl Config {
@@ -139,6 +175,20 @@ impl Config {
                     return Err(ConfigError::UdpRebindTooSoon {
                         peer: peer.name.clone(),
                         rebind_after: peer.udp_rebind_after,
+                        keepalive: peer.persistent_keepalive,
+                    });
+                }
+            }
+            if let Some(timeout) = peer.session_timeout.filter(|timeout| *timeout > 0) {
+                if peer.persistent_keepalive == 0 {
+                    return Err(ConfigError::SessionTimeoutRequiresKeepalive(
+                        peer.name.clone(),
+                    ));
+                }
+                if timeout <= peer.persistent_keepalive {
+                    return Err(ConfigError::SessionTimeoutTooSoon {
+                        peer: peer.name.clone(),
+                        timeout,
                         keepalive: peer.persistent_keepalive,
                     });
                 }
@@ -199,6 +249,7 @@ mod tests {
             public_key: VALID_KEY.to_string(),
             persistent_keepalive: 0,
             udp_rebind_after: 0,
+            session_timeout: None,
         }
     }
 
@@ -373,6 +424,58 @@ mod tests {
             Err(ConfigError::UdpRebindTooSoon {
                 rebind_after: 25,
                 keepalive: 25,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tcp_keepalive_gets_an_automatic_session_timeout() {
+        let mut p = peer("node-b");
+        p.persistent_keepalive = 5;
+        assert_eq!(p.effective_session_timeout(TransportConfig::Tcp), 15);
+        assert_eq!(p.effective_session_timeout(TransportConfig::Udp), 0);
+    }
+
+    #[test]
+    fn explicit_session_timeout_overrides_tcp_default() {
+        let mut p = peer("node-b");
+        p.persistent_keepalive = 5;
+        p.session_timeout = Some(30);
+        assert_eq!(p.effective_session_timeout(TransportConfig::Tcp), 30);
+
+        p.session_timeout = Some(0);
+        assert_eq!(p.effective_session_timeout(TransportConfig::Tcp), 0);
+    }
+
+    #[test]
+    fn rejects_session_timeout_without_keepalive() {
+        let mut p = peer("node-b");
+        p.session_timeout = Some(30);
+        let config = Config {
+            interface: interface(),
+            peer: vec![p],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::SessionTimeoutRequiresKeepalive(name)) if name == "node-b"
+        ));
+    }
+
+    #[test]
+    fn rejects_session_timeout_before_a_probe_can_run() {
+        let mut p = peer("node-b");
+        p.persistent_keepalive = 10;
+        p.session_timeout = Some(10);
+        let config = Config {
+            interface: interface(),
+            peer: vec![p],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::SessionTimeoutTooSoon {
+                timeout: 10,
+                keepalive: 10,
                 ..
             })
         ));

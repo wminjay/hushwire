@@ -5,7 +5,7 @@ use ipnet::Ipv4Net;
 use thiserror::Error;
 use x25519_dalek::PublicKey;
 
-use crate::config::{Config, PeerConfig};
+use crate::config::{Config, PeerConfig, TransportConfig};
 
 #[derive(Clone, Debug)]
 pub struct Peer {
@@ -16,6 +16,7 @@ pub struct Peer {
     pub public_key: PublicKey,
     pub persistent_keepalive: u16,
     pub udp_rebind_after: u16,
+    pub session_timeout: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -44,7 +45,7 @@ impl Router {
         let mut routes = Vec::new();
 
         for peer_config in &config.peer {
-            let peer = Arc::new(peer_from_config(peer_config));
+            let peer = Arc::new(peer_from_config(peer_config, config.interface.transport));
             for prefix in &peer_config.allowed_ips {
                 if let Some(existing) = routes.iter().find(|route: &&Route| route.prefix == *prefix)
                 {
@@ -77,7 +78,7 @@ impl Router {
     }
 }
 
-fn peer_from_config(config: &PeerConfig) -> Peer {
+fn peer_from_config(config: &PeerConfig, transport: TransportConfig) -> Peer {
     let public_key_bytes = crate::config::decode_key(&config.public_key)
         .expect("public_key validated by Config::load");
     Peer {
@@ -87,6 +88,7 @@ fn peer_from_config(config: &PeerConfig) -> Peer {
         public_key: PublicKey::from(public_key_bytes),
         persistent_keepalive: config.persistent_keepalive,
         udp_rebind_after: config.udp_rebind_after,
+        session_timeout: config.effective_session_timeout(transport),
     }
 }
 
@@ -226,6 +228,7 @@ mod tests {
             public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
             udp_rebind_after: 0,
+            session_timeout: None,
         }
     }
 
@@ -238,6 +241,7 @@ mod tests {
             public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
             udp_rebind_after: 0,
+            session_timeout: None,
         }
     }
 }

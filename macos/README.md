@@ -34,7 +34,7 @@ open dist/HushWire.app
 
 The result is `dist/HushWire.app`. It receives an ad-hoc local signature, which is sufficient for an app built and used on the same Mac. A Developer ID certificate and notarization would be needed before distributing it to other people.
 
-The v0.5.0 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
+The v0.5.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
 
 ## Prepare a client configuration
 
@@ -66,6 +66,11 @@ udp_rebind_after = 90
 ```
 
 `endpoint` currently has to be an IP address and port, not a hostname. For a split tunnel, replace `0.0.0.0/0` with only the networks that should use HushWire.
+
+For TCP profiles, a nonzero `persistent_keepalive` automatically enables stale
+session recovery after three keepalive intervals (minimum 15 seconds). Add
+`session_timeout = <seconds>` to tune the threshold; it must be greater than
+the keepalive interval. `session_timeout = 0` explicitly disables recovery.
 
 Save the file somewhere private, select it in the app, and run **检查配置** before connecting. The configuration contains secrets and is currently stored as plain text; restrict its file permissions if other local accounts can access its directory:
 

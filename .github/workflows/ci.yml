@@ -34,8 +34,17 @@ jobs:
       - name: Test
         run: cargo test --release
 
-      - name: Test one-sided restart recovery in isolated network namespaces
-        run: sudo ./tests/recovery_netns.sh target/release/hushwire
+      - name: Test UDP and TCP restart recovery in isolated network namespaces
+        run: |
+          sudo ./tests/recovery_netns.sh target/release/hushwire udp
+          sudo ./tests/recovery_netns.sh target/release/hushwire tcp
+
+      - name: Upload Linux binary for isolated deployment testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: hushwire-linux-x86_64-ci
+          path: target/release/hushwire
+          retention-days: 1
 
   macos-client:
     name: Build & Test macOS Client

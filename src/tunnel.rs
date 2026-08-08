@@ -11,7 +11,7 @@ use signal_hook::iterator::Signals;
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::config::Config;
+use crate::config::{Config, TransportConfig};
 use crate::firewall;
 use crate::packet::Ipv4Packet;
 use crate::router::{Peer, Router};
@@ -203,6 +203,7 @@ impl SessionManager {
 }
 
 pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
+    let transport_kind = config.interface.transport;
     let router = Router::new(&config)?;
 
     // Create the TUN interface before installing routes or firewall rules,
@@ -277,6 +278,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             prefix = %route.prefix,
             keepalive = route.peer.persistent_keepalive,
             udp_rebind_after = route.peer.udp_rebind_after,
+            session_timeout = route.peer.session_timeout,
             "route installed"
         );
     }
@@ -375,7 +377,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                     peer = %route.peer.name,
                     endpoint = %endpoint,
                     bytes = size,
-                    "failed to send UDP packet"
+                    "failed to send transport packet"
                 );
                 continue;
             }
@@ -637,7 +639,11 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
 
     let keepalive = thread::spawn(move || {
         let mut last_sent: HashMap<String, Instant> = HashMap::new();
-        let mut last_rebind_attempt: Option<Instant> = None;
+        // A UDP rebind affects every peer on the shared socket, so its rate
+        // limit is interface-wide. Session-only recovery is independent per
+        // peer (notably for TCP connections).
+        let mut last_udp_rebind_attempt: Option<Instant> = None;
+        let mut last_session_recovery_attempt: HashMap<String, Instant> = HashMap::new();
         loop {
             thread::sleep(Duration::from_secs(1));
             let now = Instant::now();
@@ -666,11 +672,18 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             }
 
             // Active probes turn last_seen into a bidirectional health signal.
-            // If an opted-in peer remains silent beyond its threshold, change
-            // the local UDP source port and discard the stale crypto session.
+            // UDP recovery optionally changes the source port; TCP recovery
+            // keeps the listener but must still discard the stale Noise
+            // session that a restarted peer no longer knows about.
             for route in router_for_keepalive.routes() {
-                if route.peer.udp_rebind_after == 0
-                    || !checked_peers.insert(route.peer.name.clone())
+                let Some(policy) = recovery_policy(
+                    transport_kind,
+                    route.peer.udp_rebind_after,
+                    route.peer.session_timeout,
+                ) else {
+                    continue;
+                };
+                if !checked_peers.insert(route.peer.name.clone())
                     || !last_sent.contains_key(&route.peer.name)
                     || !sessions_for_keepalive.has_active_session(&route.peer.name)
                 {
@@ -683,33 +696,43 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 let Some(last_seen) = stats.last_seen else {
                     continue;
                 };
-                if !udp_rebind_due(
-                    now,
-                    last_seen,
-                    last_rebind_attempt,
-                    Duration::from_secs(route.peer.udp_rebind_after as u64),
-                ) {
+                let last_attempt = if policy.rebind_udp {
+                    last_udp_rebind_attempt
+                } else {
+                    last_session_recovery_attempt.get(&route.peer.name).copied()
+                };
+                if !recovery_due(now, last_seen, last_attempt, policy.timeout) {
                     continue;
                 }
 
-                last_rebind_attempt = Some(now);
-                match keepalive_transport.rebind_to_ephemeral() {
-                    Ok(Some(result)) => {
-                        warn!(
-                            peer = %route.peer.name,
-                            silence_seconds = now.duration_since(last_seen).as_secs(),
-                            previous_listen = %result.previous,
-                            current_listen = %result.current,
-                            "no authenticated keepalive response; rebound UDP socket to recover the NAT path"
-                        );
-                        rebound = true;
+                if policy.rebind_udp {
+                    last_udp_rebind_attempt = Some(now);
+                    match keepalive_transport.rebind_to_ephemeral() {
+                        Ok(Some(result)) => {
+                            warn!(
+                                peer = %route.peer.name,
+                                silence_seconds = now.duration_since(last_seen).as_secs(),
+                                previous_listen = %result.previous,
+                                current_listen = %result.current,
+                                "no authenticated keepalive response; rebound UDP socket to recover the NAT path"
+                            );
+                            rebound = true;
+                        }
+                        Ok(None) => {
+                            error!(peer = %route.peer.name, "configured UDP rebind is unsupported by the active transport");
+                        }
+                        Err(error) => {
+                            warn!(%error, peer = %route.peer.name, "failed to rebind UDP socket after peer liveness timeout");
+                        }
                     }
-                    Ok(None) => {
-                        error!(peer = %route.peer.name, "configured UDP rebind is unsupported by the active transport");
-                    }
-                    Err(error) => {
-                        warn!(%error, peer = %route.peer.name, "failed to rebind UDP socket after peer liveness timeout");
-                    }
+                } else {
+                    last_session_recovery_attempt.insert(route.peer.name.clone(), now);
+                    warn!(
+                        peer = %route.peer.name,
+                        transport = ?transport_kind,
+                        silence_seconds = now.duration_since(last_seen).as_secs(),
+                        "no authenticated keepalive response; session recovery timeout reached"
+                    );
                 }
 
                 // A remote process restart destroys its in-memory session.
@@ -741,11 +764,17 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                     continue;
                 }
                 let interval = Duration::from_secs(route.peer.persistent_keepalive as u64);
+                let recovery_enabled = recovery_policy(
+                    transport_kind,
+                    route.peer.udp_rebind_after,
+                    route.peer.session_timeout,
+                )
+                .is_some();
                 let should_send = keepalive_should_send(
                     now,
                     last_sent.get(&route.peer.name).copied(),
                     interval,
-                    route.peer.udp_rebind_after > 0,
+                    recovery_enabled,
                     rebound,
                 );
                 if !should_send {
@@ -760,12 +789,12 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 let Some((send_key, session_id)) =
                     sessions_for_keepalive.get_send_key(&route.peer.name)
                 else {
-                    if route.peer.udp_rebind_after == 0 {
+                    if !recovery_enabled {
                         last_sent.insert(route.peer.name.clone(), now);
                     }
                     continue;
                 };
-                let payload = if route.peer.udp_rebind_after > 0 {
+                let payload = if recovery_enabled {
                     auth::KEEPALIVE_PROBE_PAYLOAD
                 } else {
                     b""
@@ -943,13 +972,36 @@ fn normalize_shutdown_signal_state() -> std::io::Result<()> {
     Ok(())
 }
 
-fn udp_rebind_due(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecoveryPolicy {
+    timeout: Duration,
+    rebind_udp: bool,
+}
+
+fn recovery_policy(
+    transport: TransportConfig,
+    udp_rebind_after: u16,
+    session_timeout: u64,
+) -> Option<RecoveryPolicy> {
+    if transport == TransportConfig::Udp && udp_rebind_after > 0 {
+        return Some(RecoveryPolicy {
+            timeout: Duration::from_secs(u64::from(udp_rebind_after)),
+            rebind_udp: true,
+        });
+    }
+    (session_timeout > 0).then_some(RecoveryPolicy {
+        timeout: Duration::from_secs(session_timeout),
+        rebind_udp: false,
+    })
+}
+
+fn recovery_due(
     now: Instant,
     last_seen: Instant,
-    last_rebind_attempt: Option<Instant>,
+    last_recovery_attempt: Option<Instant>,
     timeout: Duration,
 ) -> bool {
-    let health_baseline = last_rebind_attempt
+    let health_baseline = last_recovery_attempt
         .map(|attempt| attempt.max(last_seen))
         .unwrap_or(last_seen);
     now.saturating_duration_since(health_baseline) >= timeout
@@ -1240,23 +1292,18 @@ mod tests {
     }
 
     #[test]
-    fn udp_rebind_becomes_due_after_inbound_silence() {
+    fn recovery_becomes_due_after_inbound_silence() {
         let now = Instant::now();
         let last_seen = now.checked_sub(Duration::from_secs(91)).unwrap();
-        assert!(udp_rebind_due(
-            now,
-            last_seen,
-            None,
-            Duration::from_secs(90)
-        ));
+        assert!(recovery_due(now, last_seen, None, Duration::from_secs(90)));
     }
 
     #[test]
-    fn recent_inbound_packet_cancels_rebind() {
+    fn recent_inbound_packet_cancels_recovery() {
         let now = Instant::now();
         let last_seen = now.checked_sub(Duration::from_secs(5)).unwrap();
         let old_attempt = now.checked_sub(Duration::from_secs(120));
-        assert!(!udp_rebind_due(
+        assert!(!recovery_due(
             now,
             last_seen,
             old_attempt,
@@ -1265,16 +1312,44 @@ mod tests {
     }
 
     #[test]
-    fn failed_rebind_attempt_is_rate_limited() {
+    fn failed_recovery_attempt_is_rate_limited() {
         let now = Instant::now();
         let last_seen = now.checked_sub(Duration::from_secs(180)).unwrap();
         let recent_attempt = now.checked_sub(Duration::from_secs(5));
-        assert!(!udp_rebind_due(
+        assert!(!recovery_due(
             now,
             last_seen,
             recent_attempt,
             Duration::from_secs(90)
         ));
+    }
+
+    #[test]
+    fn udp_rebind_policy_takes_precedence_over_session_only_timeout() {
+        assert_eq!(
+            recovery_policy(TransportConfig::Udp, 90, 30),
+            Some(RecoveryPolicy {
+                timeout: Duration::from_secs(90),
+                rebind_udp: true,
+            })
+        );
+    }
+
+    #[test]
+    fn tcp_recovery_policy_invalidates_session_without_udp_rebind() {
+        assert_eq!(
+            recovery_policy(TransportConfig::Tcp, 0, 15),
+            Some(RecoveryPolicy {
+                timeout: Duration::from_secs(15),
+                rebind_udp: false,
+            })
+        );
+    }
+
+    #[test]
+    fn zero_timeouts_disable_session_recovery() {
+        assert_eq!(recovery_policy(TransportConfig::Udp, 0, 0), None);
+        assert_eq!(recovery_policy(TransportConfig::Tcp, 0, 0), None);
     }
 
     #[test]
