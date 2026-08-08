@@ -164,6 +164,12 @@ allowed_ips = ["0.0.0.0/0"]
 
 That means peer A will send every IPv4 destination to peer B through HushWire.
 
+HushWire currently manages IPv4 routes only and does not change the system DNS
+configuration. A full-tunnel profile therefore does not by itself prevent DNS
+queries from using an existing local or VPN resolver, and it does not carry
+IPv6 traffic. Configure DNS and IPv6 separately when those paths must not bypass
+the tunnel.
+
 Peer B must also be configured as an exit node at the operating-system level. Passing `--exit-node` to `up` does this automatically (on Linux, via iptables):
 
 - enable IPv4 forwarding (`net.ipv4.ip_forward=1`, restored to its prior value on shutdown)

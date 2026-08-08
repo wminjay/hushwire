@@ -73,11 +73,13 @@ The wire format remains compatible with v0.4.1 and v0.5.0. The surviving TCP pee
 - **Full-tunnel via exit node** — NAT'd client sends all traffic through the server
 - Clean shutdown verified — routes, firewall rules, and TUN device removed on SIGTERM
 - **One-sided restart recovery over UDP and TCP** — verified in isolated Linux network namespaces while preserving the client process
-- **macOS GUI lifecycle** — privileged connect and graceful disconnect verified with a no-peer/no-route safety config while the default route stayed unchanged
+- **Real macOS GUI tunnels** — UDP and TCP connectivity, one-sided server restart recovery with the original Mac client PID preserved, and graceful disconnect cleanup verified against an isolated public test server
+- **macOS exit routing** — targeted and full IPv4 exit profiles verified through an isolated Linux exit node, including endpoint-loop prevention, NAT egress, HTTPS, and complete route cleanup on disconnect
 
 ## Known limitations
 
 - **Exit-node NAT is Linux-only** — macOS is supported as a peer/client.
+- **IPv4 routing only; DNS is unmanaged** — full-tunnel profiles do not carry IPv6 or replace existing local/VPN DNS resolvers, so those paths require separate policy when bypass must be prevented.
 - **The macOS GUI is ad-hoc signed and not notarized** — it is a personal client, not an App Store build, and currently requests administrator authorization for both connect and disconnect.
 - **Probe acknowledgements require v0.4.1 or newer on both peers**; the surviving peer needs v0.5.0 for UDP stale-session replacement and v0.5.1 for TCP recovery.
 - **Not audited** — experimental project.
