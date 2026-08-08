@@ -1,0 +1,148 @@
+#!/bin/zsh
+
+set -eu
+
+fail() {
+    print -u2 -- "hushwire-control: $1"
+    exit 1
+}
+
+[[ $# -ge 2 ]] || fail "usage: hushwire-control <start|stop|status> <uid> [arguments]"
+
+action="$1"
+user_id="$2"
+shift 2
+
+[[ "$user_id" == <-> ]] || fail "uid must be numeric"
+[[ "$user_id" -gt 0 ]] || fail "refusing to manage a root login session"
+
+pid_file="/var/run/hushwire-${user_id}.pid"
+binary_file="/var/run/hushwire-${user_id}.binary"
+
+read_pid() {
+    [[ -f "$pid_file" ]] || return 1
+    local value
+    value="$(<"$pid_file")"
+    [[ "$value" == <-> ]] || return 1
+    [[ "$value" -gt 1 ]] || return 1
+    print -r -- "$value"
+}
+
+is_running() {
+    local process_id="$1"
+    /bin/kill -0 "$process_id" >/dev/null 2>&1
+}
+
+is_managed_process() {
+    local process_id="$1"
+    [[ -f "$binary_file" ]] || return 1
+
+    local expected_binary process_command
+    expected_binary="$(<"$binary_file")"
+    [[ -n "$expected_binary" ]] || return 1
+    process_command="$(/bin/ps -p "$process_id" -o command= 2>/dev/null)" || return 1
+
+    [[ "$process_command" == "$expected_binary" || "$process_command" == "$expected_binary "* ]]
+}
+
+clear_state() {
+    /bin/rm -f "$pid_file" "$binary_file"
+}
+
+case "$action" in
+    start)
+        [[ $# -eq 3 ]] || fail "start requires <binary> <config> <log>"
+        binary_path="$1"
+        config_path="$2"
+        log_path="$3"
+
+        [[ -x "$binary_path" ]] || fail "HushWire binary is not executable: $binary_path"
+        [[ -f "$config_path" ]] || fail "configuration does not exist: $config_path"
+        [[ -f "$log_path" ]] || fail "log file does not exist: $log_path"
+
+        if process_id="$(read_pid 2>/dev/null)" \
+            && is_running "$process_id" \
+            && is_managed_process "$process_id"; then
+            print -r -- "HushWire is already running (PID $process_id)."
+            exit 0
+        fi
+
+        clear_state
+        # `nohup` fails with ENOTTY when this script is launched by
+        # AppleScript's privileged `do shell script` on current macOS. zsh's
+        # `&!` starts the process in the background and removes it from the
+        # shell job table, while the explicit redirections detach every file
+        # descriptor inherited from the authorization subprocess.
+        (
+            trap - HUP INT TERM
+            exec "$binary_path" --log-format text up --config "$config_path"
+        ) >>"$log_path" 2>&1 </dev/null &!
+        process_id=$!
+
+        umask 022
+        print -r -- "$process_id" >"$pid_file"
+        print -r -- "$binary_path" >"$binary_file"
+        /bin/chmod 0644 "$pid_file" "$binary_file"
+
+        /bin/sleep 1
+        if ! is_running "$process_id"; then
+            clear_state
+            print -u2 -- "HushWire stopped during startup. Recent log output:"
+            /usr/bin/tail -n 24 "$log_path" >&2 || true
+            exit 1
+        fi
+
+        print -r -- "HushWire started (PID $process_id)."
+        ;;
+
+    stop)
+        [[ $# -eq 0 ]] || fail "stop does not accept additional arguments"
+
+        if ! process_id="$(read_pid 2>/dev/null)"; then
+            clear_state
+            print -r -- "HushWire is not running."
+            exit 0
+        fi
+
+        if ! is_running "$process_id"; then
+            clear_state
+            print -r -- "Removed a stale HushWire PID file."
+            exit 0
+        fi
+
+        if ! is_managed_process "$process_id"; then
+            clear_state
+            print -r -- "Removed stale state without signaling unrelated PID $process_id."
+            exit 0
+        fi
+
+        /bin/kill -TERM "$process_id" || fail "could not signal PID $process_id"
+
+        for _ in {1..80}; do
+            if ! is_running "$process_id"; then
+                clear_state
+                print -r -- "HushWire stopped."
+                exit 0
+            fi
+            /bin/sleep 0.1
+        done
+
+        fail "PID $process_id did not stop cleanly; it was not force-killed so route cleanup can finish"
+        ;;
+
+    status)
+        [[ $# -eq 0 ]] || fail "status does not accept additional arguments"
+        if process_id="$(read_pid 2>/dev/null)" \
+            && is_running "$process_id" \
+            && is_managed_process "$process_id"; then
+            print -r -- "running $process_id"
+            exit 0
+        fi
+        print -r -- "stopped"
+        exit 3
+        ;;
+
+    *)
+        fail "unknown action: $action"
+        ;;
+esac

@@ -84,9 +84,43 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.tar.gz.sha256
 
+  macos-app:
+    name: Build macOS personal client
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app-aarch64
+
+      - name: Build and sign app bundle
+        env:
+          HUSHWIRE_RUST_TARGET: aarch64-apple-darwin
+          HUSHWIRE_SWIFT_ARCH: arm64
+        run: ./macos/scripts/build-app.sh
+
+      - name: Package app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/HushWire.app HushWire-aarch64-macos-app.zip
+          shasum -a 256 HushWire-aarch64-macos-app.zip > HushWire-aarch64-macos-app.zip.sha256
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hushwire-aarch64-macos-app
+          path: |
+            HushWire-aarch64-macos-app.zip
+            HushWire-aarch64-macos-app.zip.sha256
+
   release:
     name: Publish to GitHub Release
-    needs: build
+    needs: [build, macos-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target
+/dist
+/macos/.build
 **/*.rs.bk
 
 # macOS
