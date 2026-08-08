@@ -9,12 +9,12 @@ use anyhow::Context;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use tracing::{debug, error, info, warn};
-use x25519_dalek::StaticSecret;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::config::Config;
 use crate::firewall;
 use crate::packet::Ipv4Packet;
-use crate::router::Router;
+use crate::router::{Peer, Router};
 use crate::routing::{self, InstalledRoute};
 use crate::state::PeerState;
 use crate::transport;
@@ -24,6 +24,25 @@ use hushwire::replay;
 
 const MAX_PACKET_SIZE: usize = 65_535;
 const PACKET_INFO_SIZE: usize = 4;
+const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+struct PendingInitiator {
+    state: noise::InitiatorState,
+    message: Vec<u8>,
+    last_sent: Instant,
+}
+
+struct CachedResponderHandshake {
+    request: Vec<u8>,
+    response: Vec<u8>,
+}
+
+#[derive(Default)]
+struct SessionState {
+    sessions: HashMap<String, Session>,
+    pending_init: HashMap<String, PendingInitiator>,
+    responder_cache: HashMap<String, CachedResponderHandshake>,
+}
 
 /// Per-peer session state, shared across threads.
 ///
@@ -32,10 +51,7 @@ const PACKET_INFO_SIZE: usize = 4;
 /// receiver thread looks up by `session_id` to find `recv_key`.
 #[derive(Default)]
 struct SessionManager {
-    /// peer_name → active session
-    sessions: Mutex<HashMap<String, Session>>,
-    /// peer_name → pending initiator state (sender creates, receiver completes)
-    pending_init: Mutex<HashMap<String, noise::InitiatorState>>,
+    inner: Mutex<SessionState>,
 }
 
 impl SessionManager {
@@ -48,8 +64,8 @@ impl SessionManager {
         &self,
         peer_name: &str,
     ) -> Option<([u8; auth::KEY_SIZE], [u8; auth::SESSION_ID_SIZE])> {
-        let sessions = self.sessions.lock().unwrap();
-        let session = sessions.get(peer_name)?;
+        let state = self.inner.lock().unwrap();
+        let session = state.sessions.get(peer_name)?;
         if session.needs_rekey() {
             return None;
         }
@@ -61,8 +77,8 @@ impl SessionManager {
         &self,
         session_id: &[u8; auth::SESSION_ID_SIZE],
     ) -> Option<([u8; auth::KEY_SIZE], String)> {
-        let sessions = self.sessions.lock().unwrap();
-        for (peer_name, session) in sessions.iter() {
+        let state = self.inner.lock().unwrap();
+        for (peer_name, session) in &state.sessions {
             if &session.session_id == session_id {
                 return Some((session.recv_key, peer_name.clone()));
             }
@@ -70,29 +86,119 @@ impl SessionManager {
         None
     }
 
-    /// Store a newly negotiated session for a peer (replaces any existing one).
-    fn store(&self, peer_name: &str, session: Session) {
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.insert(peer_name.to_string(), session);
+    /// Store an initiator-side session, replacing any prior responder cache.
+    fn store_initiator(&self, peer_name: &str, session: Session) {
+        let mut state = self.inner.lock().unwrap();
+        state.sessions.insert(peer_name.to_string(), session);
+        state.responder_cache.remove(peer_name);
     }
 
-    /// Store a pending initiator handshake state (created by sender thread,
-    /// completed by receiver thread when the response arrives).
-    fn store_pending_init(&self, peer_name: &str, state: noise::InitiatorState) {
-        let mut pending = self.pending_init.lock().unwrap();
-        pending.insert(peer_name.to_string(), state);
+    /// Store a responder-side session and cache its response. Retransmitted
+    /// copies of the same msg1 must receive the same msg2; generating a new
+    /// responder session for every retry can leave the two sides on different
+    /// keys when responses are delayed or reordered.
+    fn store_responder(
+        &self,
+        peer_name: &str,
+        session: Session,
+        request: Vec<u8>,
+        response: Vec<u8>,
+    ) {
+        let mut state = self.inner.lock().unwrap();
+        state.sessions.insert(peer_name.to_string(), session);
+        state.responder_cache.insert(
+            peer_name.to_string(),
+            CachedResponderHandshake { request, response },
+        );
+    }
+
+    fn cached_responder_response(&self, peer_name: &str, request: &[u8]) -> Option<Vec<u8>> {
+        let state = self.inner.lock().unwrap();
+        let cached = state.responder_cache.get(peer_name)?;
+        (cached.request == request).then(|| cached.response.clone())
+    }
+
+    /// Start a new initiator handshake, or retransmit the exact same msg1 when
+    /// its response has not arrived within the retry interval.
+    fn start_or_retry_handshake(
+        &self,
+        peer_name: &str,
+        local_static: &StaticSecret,
+        remote_static_pub: &PublicKey,
+        psk: &[u8; 32],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        let mut state = self.inner.lock().unwrap();
+
+        if state
+            .sessions
+            .get(peer_name)
+            .is_some_and(|session| !session.needs_rekey())
+        {
+            return None;
+        }
+        // A session that reached its rekey threshold must not continue to
+        // suppress a fresh handshake.
+        state.sessions.remove(peer_name);
+        state.responder_cache.remove(peer_name);
+
+        if let Some(pending) = state.pending_init.get_mut(peer_name) {
+            if now.saturating_duration_since(pending.last_sent) < HANDSHAKE_RETRY_INTERVAL {
+                return None;
+            }
+            pending.last_sent = now;
+            return Some(pending.message.clone());
+        }
+
+        let handshake = noise::initiator_start(local_static, remote_static_pub, psk);
+        let (message, initiator_state) = handshake.into_parts();
+        state.pending_init.insert(
+            peer_name.to_string(),
+            PendingInitiator {
+                state: initiator_state,
+                message: message.clone(),
+                last_sent: now,
+            },
+        );
+        Some(message)
     }
 
     /// Take a pending initiator handshake state (consumes it).
     fn take_pending_init(&self, peer_name: &str) -> Option<noise::InitiatorState> {
-        let mut pending = self.pending_init.lock().unwrap();
-        pending.remove(peer_name)
+        let mut state = self.inner.lock().unwrap();
+        state
+            .pending_init
+            .remove(peer_name)
+            .map(|pending| pending.state)
     }
 
     /// Check if a pending initiator handshake exists for a peer.
     fn has_pending_init(&self, peer_name: &str) -> bool {
-        let pending = self.pending_init.lock().unwrap();
-        pending.contains_key(peer_name)
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_init
+            .contains_key(peer_name)
+    }
+
+    fn has_active_session(&self, peer_name: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(peer_name)
+            .is_some_and(|session| !session.needs_rekey())
+    }
+
+    /// Discard all cryptographic state for a peer before recovery. Keeping an
+    /// old session after the remote process restarted prevents a new handshake
+    /// because both sides continue speaking with unrelated session IDs/keys.
+    fn invalidate_peer(&self, peer_name: &str) -> bool {
+        let mut state = self.inner.lock().unwrap();
+        let removed_session = state.sessions.remove(peer_name).is_some();
+        let removed_pending = state.pending_init.remove(peer_name).is_some();
+        state.responder_cache.remove(peer_name);
+        removed_session || removed_pending
     }
 }
 
@@ -131,6 +237,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
     });
     let cleanup_for_signal = cleanup.clone();
 
+    normalize_shutdown_signal_state().context("preparing shutdown signal handlers")?;
     let mut signals =
         Signals::new([SIGINT, SIGTERM, SIGHUP]).context("registering signal handlers")?;
     thread::spawn(move || {
@@ -195,6 +302,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
     let sessions_for_keepalive = session_mgr.clone();
     let static_for_sender = local_static.clone();
     let static_for_receiver = local_static.clone();
+    let static_for_keepalive = local_static.clone();
 
     let tun_to_transport = thread::spawn(move || {
         let mut packet = vec![0_u8; MAX_PACKET_SIZE];
@@ -236,38 +344,31 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             let (send_key, session_id) = match sessions_for_sender.get_send_key(&route.peer.name) {
                 Some(keys) => keys,
                 None => {
-                    // No active session — initiate Noise handshake, then drop this packet.
-                    // Avoid spamming: only initiate if no pending handshake exists.
-                    if sessions_for_sender.has_pending_init(&route.peer.name) {
-                        continue;
-                    }
-                    let handshake = noise::initiator_start(
+                    // No active session — initiate (or retry) the Noise
+                    // handshake, then drop this packet until it completes.
+                    send_handshake_init(
+                        &sessions_for_sender,
                         &static_for_sender,
-                        &route.peer.public_key,
-                        &route.peer.psk,
+                        &route.peer,
+                        &state_for_sender,
+                        transport_writer.as_ref(),
+                        Instant::now(),
                     );
-                    let (msg1, state) = handshake.into_parts();
-                    sessions_for_sender.store_pending_init(&route.peer.name, state);
-                    let endpoint =
-                        resolve_endpoint(&state_for_sender, &route.peer.name, route.peer.endpoint);
-                    // Wrap msg1 in a HushWire handshake packet (encrypted with PSK).
-                    let hs_packet = auth::encode_packet(
-                        &msg1,
-                        &route.peer.psk,
-                        auth::MsgType::HandshakeInit,
-                        &[0u8; auth::SESSION_ID_SIZE],
-                    );
-                    if let Err(e) = transport_writer.send_to(&hs_packet, endpoint) {
-                        warn!(%e, peer = %route.peer.name, "failed to send handshake init");
-                    }
-                    debug!(peer = %route.peer.name, "initiated handshake, dropping data packet until session established");
                     continue;
                 }
             };
 
             let encoded = auth::encode_packet(frame, &send_key, auth::MsgType::Data, &session_id);
-            let endpoint =
-                resolve_endpoint(&state_for_sender, &route.peer.name, route.peer.endpoint);
+            let Some(endpoint) =
+                resolve_endpoint(&state_for_sender, &route.peer.name, route.peer.endpoint)
+            else {
+                warn!(
+                    peer = %route.peer.name,
+                    configured_endpoint = %route.peer.endpoint,
+                    "cannot send data without a usable configured or learned endpoint"
+                );
+                continue;
+            };
             if let Err(error) = transport_writer.send_to(&encoded, endpoint) {
                 error!(
                     %error,
@@ -343,19 +444,56 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                         let Some(route) = route else {
                             continue;
                         };
+
+                        // A retried msg1 must receive the original msg2. If we
+                        // generated a fresh responder session for the same
+                        // initiator state, reordered responses could make each
+                        // side install a different key pair.
+                        if let Some(response) =
+                            sessions_for_receiver.cached_responder_response(&peer_name, &payload)
+                        {
+                            let hs_packet = auth::encode_packet(
+                                &response,
+                                &route.peer.psk,
+                                auth::MsgType::HandshakeResponse,
+                                &[0u8; auth::SESSION_ID_SIZE],
+                            );
+                            match transport.send_to(&hs_packet, source) {
+                                Ok(_) => debug!(
+                                    peer = %peer_name,
+                                    source = %source,
+                                    "re-sent cached handshake response"
+                                ),
+                                Err(error) => warn!(
+                                    %error,
+                                    peer = %peer_name,
+                                    "failed to re-send cached handshake response"
+                                ),
+                            }
+                            state_for_receiver.record_keepalive(&peer_name, source);
+                            continue;
+                        }
+
                         let hs = noise::responder_respond(
                             &static_for_receiver,
                             &route.peer.psk,
                             &payload,
                         );
                         if let Some(hs) = hs {
-                            // Store the new session.
-                            sessions_for_receiver.store(&peer_name, hs.session);
+                            let response = hs.message;
+                            // Store the new session and enough handshake state
+                            // to answer an identical retransmission safely.
+                            sessions_for_receiver.store_responder(
+                                &peer_name,
+                                hs.session,
+                                payload.clone(),
+                                response.clone(),
+                            );
                             // Reset replay filter for this peer (new session = new nonce space).
                             replay.insert(peer_name.clone(), replay::ReplayFilter::new());
                             // Send msg2 back.
                             let hs_packet = auth::encode_packet(
-                                &hs.message,
+                                &response,
                                 &route.peer.psk,
                                 auth::MsgType::HandshakeResponse,
                                 &[0u8; auth::SESSION_ID_SIZE],
@@ -388,7 +526,7 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                             &payload,
                         );
                         if let Some(session) = session {
-                            sessions_for_receiver.store(&peer_name, session);
+                            sessions_for_receiver.store_initiator(&peer_name, session);
                             replay.insert(peer_name.clone(), replay::ReplayFilter::new());
                             info!(peer = %peer_name, source = %source, "handshake completed (initiator), session established");
                         } else {
@@ -507,16 +645,34 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
             let mut checked_peers = HashSet::new();
             let mut rebound = false;
 
+            // A lost handshake response used to leave pending_init occupied
+            // forever. Retry the same msg1 on a timer even when the triggering
+            // TUN packet was a one-off and no further traffic arrives.
+            let mut handshake_peers = HashSet::new();
+            for route in router_for_keepalive.routes() {
+                if !handshake_peers.insert(route.peer.name.clone())
+                    || !sessions_for_keepalive.has_pending_init(&route.peer.name)
+                {
+                    continue;
+                }
+                send_handshake_init(
+                    &sessions_for_keepalive,
+                    &static_for_keepalive,
+                    &route.peer,
+                    &state_for_keepalive,
+                    keepalive_transport.as_ref(),
+                    now,
+                );
+            }
+
             // Active probes turn last_seen into a bidirectional health signal.
             // If an opted-in peer remains silent beyond its threshold, change
-            // the local UDP source port so broken NAT state cannot follow us.
+            // the local UDP source port and discard the stale crypto session.
             for route in router_for_keepalive.routes() {
                 if route.peer.udp_rebind_after == 0
                     || !checked_peers.insert(route.peer.name.clone())
                     || !last_sent.contains_key(&route.peer.name)
-                    || sessions_for_keepalive
-                        .get_send_key(&route.peer.name)
-                        .is_none()
+                    || !sessions_for_keepalive.has_active_session(&route.peer.name)
                 {
                     continue;
                 }
@@ -555,6 +711,24 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                         warn!(%error, peer = %route.peer.name, "failed to rebind UDP socket after peer liveness timeout");
                     }
                 }
+
+                // A remote process restart destroys its in-memory session.
+                // Keeping our old key would make all new handshakes impossible
+                // until this process is manually restarted as well.
+                let had_stale_state = sessions_for_keepalive.invalidate_peer(&route.peer.name);
+                warn!(
+                    peer = %route.peer.name,
+                    had_stale_state,
+                    "peer liveness timeout invalidated the old session; starting a fresh handshake"
+                );
+                send_handshake_init(
+                    &sessions_for_keepalive,
+                    &static_for_keepalive,
+                    &route.peer,
+                    &state_for_keepalive,
+                    keepalive_transport.as_ref(),
+                    now,
+                );
                 break;
             }
 
@@ -581,8 +755,8 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Use the session key if available; cold-start handshakes are
-                // still initiated by real TUN traffic.
+                // Use the session key if available. Cold-start handshakes are
+                // initiated by real TUN traffic and then retried by this loop.
                 let Some((send_key, session_id)) =
                     sessions_for_keepalive.get_send_key(&route.peer.name)
                 else {
@@ -598,8 +772,17 @@ pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
                 };
                 let packet =
                     auth::encode_packet(payload, &send_key, auth::MsgType::Keepalive, &session_id);
-                let endpoint =
-                    resolve_endpoint(&state_for_keepalive, &route.peer.name, route.peer.endpoint);
+                let Some(endpoint) =
+                    resolve_endpoint(&state_for_keepalive, &route.peer.name, route.peer.endpoint)
+                else {
+                    warn!(
+                        peer = %route.peer.name,
+                        configured_endpoint = %route.peer.endpoint,
+                        "cannot send keepalive without a usable configured or learned endpoint"
+                    );
+                    last_sent.insert(route.peer.name.clone(), now);
+                    continue;
+                };
                 match keepalive_transport.send_to(&packet, endpoint) {
                     Ok(_) => state_for_keepalive.record_tx(&route.peer.name, packet.len()),
                     Err(error) => {
@@ -650,6 +833,57 @@ struct TunDevice {
     packet_information: bool,
 }
 
+fn send_handshake_init(
+    sessions: &SessionManager,
+    local_static: &StaticSecret,
+    peer: &Peer,
+    state: &PeerState,
+    transport: &dyn transport::PacketTransport,
+    now: Instant,
+) {
+    // `0.0.0.0:<port>` and `[::]:<port>` are valid listen addresses but not
+    // peer destinations. On some systems sending to an unspecified address
+    // loops the datagram back to localhost, creating a false self-session.
+    let Some(endpoint) = resolve_endpoint(state, &peer.name, peer.endpoint) else {
+        debug!(
+            peer = %peer.name,
+            configured_endpoint = %peer.endpoint,
+            "cannot initiate handshake until a usable peer endpoint is learned"
+        );
+        return;
+    };
+
+    let Some(message) = sessions.start_or_retry_handshake(
+        &peer.name,
+        local_static,
+        &peer.public_key,
+        &peer.psk,
+        now,
+    ) else {
+        return;
+    };
+
+    let packet = auth::encode_packet(
+        &message,
+        &peer.psk,
+        auth::MsgType::HandshakeInit,
+        &[0u8; auth::SESSION_ID_SIZE],
+    );
+    match transport.send_to(&packet, endpoint) {
+        Ok(_) => debug!(
+            peer = %peer.name,
+            endpoint = %endpoint,
+            "sent handshake init; data waits for session establishment"
+        ),
+        Err(error) => warn!(
+            %error,
+            peer = %peer.name,
+            endpoint = %endpoint,
+            "failed to send handshake init"
+        ),
+    }
+}
+
 /// Resolve the destination endpoint for outbound packets to a peer.
 ///
 /// Prefers the address learned from a recent inbound packet (NAT traversal /
@@ -658,13 +892,55 @@ struct TunDevice {
 /// establish connectivity by sending keepalives: once the server sees a
 /// packet from the peer's real source address, it replies there instead of
 /// the (possibly unreachable) configured endpoint.
-fn resolve_endpoint(state: &PeerState, peer_name: &str, configured: SocketAddr) -> SocketAddr {
+fn resolve_endpoint(
+    state: &PeerState,
+    peer_name: &str,
+    configured: SocketAddr,
+) -> Option<SocketAddr> {
     let snapshot = state.snapshot();
     snapshot
         .get(peer_name)
         .and_then(|stats| stats.current_endpoint)
-        .filter(|learned| *learned != configured)
-        .unwrap_or(configured)
+        .filter(|endpoint| usable_peer_endpoint(*endpoint))
+        .or_else(|| usable_peer_endpoint(configured).then_some(configured))
+}
+
+fn usable_peer_endpoint(endpoint: SocketAddr) -> bool {
+    !endpoint.ip().is_unspecified() && endpoint.port() != 0
+}
+
+/// Privileged GUI launchers and non-interactive shells may leave termination
+/// signals ignored or blocked in their children. Reset these signals before
+/// signal-hook installs HushWire's handlers so GUI disconnect can always
+/// trigger route, firewall, and TUN cleanup.
+fn normalize_shutdown_signal_state() -> std::io::Result<()> {
+    let shutdown_signals = [SIGHUP, SIGINT, SIGTERM];
+
+    // SAFETY: all pointers refer to initialized local storage, the signal
+    // numbers are platform constants, and this runs before HushWire spawns its
+    // worker threads or installs its own signal handlers.
+    unsafe {
+        let mut signal_set: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut signal_set) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        for signal in shutdown_signals {
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::sigaddset(&mut signal_set, signal) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        let result = libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, std::ptr::null_mut());
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result));
+        }
+    }
+
+    Ok(())
 }
 
 fn udp_rebind_due(
@@ -784,6 +1060,184 @@ impl Cleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete_managed_handshake(
+        initiator: &SessionManager,
+        responder: &SessionManager,
+        initiator_static: &StaticSecret,
+        responder_static: &StaticSecret,
+        responder_public: &PublicKey,
+        psk: &[u8; 32],
+        now: Instant,
+    ) -> [u8; auth::SESSION_ID_SIZE] {
+        let request = initiator
+            .start_or_retry_handshake("peer", initiator_static, responder_public, psk, now)
+            .expect("handshake request");
+        let response =
+            noise::responder_respond(responder_static, psk, &request).expect("handshake response");
+        let responder_send_key = response.session.send_key;
+        let responder_recv_key = response.session.recv_key;
+        let response_message = response.message.clone();
+        responder.store_responder("peer", response.session, request, response_message.clone());
+
+        let pending = initiator
+            .take_pending_init("peer")
+            .expect("pending initiator state");
+        let session = noise::initiator_finalize(
+            pending,
+            initiator_static,
+            responder_public,
+            &response_message,
+        )
+        .expect("finalized initiator session");
+        assert_eq!(session.send_key, responder_recv_key);
+        assert_eq!(session.recv_key, responder_send_key);
+        let session_id = session.session_id;
+        initiator.store_initiator("peer", session);
+
+        assert!(initiator.has_active_session("peer"));
+        assert!(responder.has_active_session("peer"));
+        session_id
+    }
+
+    #[test]
+    fn one_sided_restart_can_replace_the_surviving_old_session() {
+        let initiator_static = StaticSecret::from([0x11; 32]);
+        let responder_static = StaticSecret::from([0x22; 32]);
+        let responder_public = PublicKey::from(&responder_static);
+        let psk = [0x33; 32];
+        let initiator = SessionManager::new();
+        let responder_before_restart = SessionManager::new();
+        let now = Instant::now();
+
+        let old_session_id = complete_managed_handshake(
+            &initiator,
+            &responder_before_restart,
+            &initiator_static,
+            &responder_static,
+            &responder_public,
+            &psk,
+            now,
+        );
+
+        // The responder process restarts and loses all in-memory crypto state.
+        let responder_after_restart = SessionManager::new();
+        assert!(initiator.invalidate_peer("peer"));
+        assert!(!initiator.has_active_session("peer"));
+        assert!(initiator
+            .get_recv_key_by_session_id(&old_session_id)
+            .is_none());
+
+        complete_managed_handshake(
+            &initiator,
+            &responder_after_restart,
+            &initiator_static,
+            &responder_static,
+            &responder_public,
+            &psk,
+            now + Duration::from_secs(1),
+        );
+    }
+
+    #[test]
+    fn lost_handshake_response_retries_the_same_exchange() {
+        let initiator_static = StaticSecret::from([0x44; 32]);
+        let responder_static = StaticSecret::from([0x55; 32]);
+        let responder_public = PublicKey::from(&responder_static);
+        let psk = [0x66; 32];
+        let initiator = SessionManager::new();
+        let responder = SessionManager::new();
+        let now = Instant::now();
+
+        let first_request = initiator
+            .start_or_retry_handshake("peer", &initiator_static, &responder_public, &psk, now)
+            .expect("initial request");
+        let response =
+            noise::responder_respond(&responder_static, &psk, &first_request).expect("response");
+        let responder_send_key = response.session.send_key;
+        let responder_recv_key = response.session.recv_key;
+        let response_message = response.message.clone();
+        responder.store_responder(
+            "peer",
+            response.session,
+            first_request.clone(),
+            response_message.clone(),
+        );
+
+        // Simulate dropping msg2. The retry timer must neither spin nor create
+        // a new initiator ephemeral key.
+        assert!(initiator
+            .start_or_retry_handshake(
+                "peer",
+                &initiator_static,
+                &responder_public,
+                &psk,
+                now + (HANDSHAKE_RETRY_INTERVAL - Duration::from_millis(1)),
+            )
+            .is_none());
+        let retry = initiator
+            .start_or_retry_handshake(
+                "peer",
+                &initiator_static,
+                &responder_public,
+                &psk,
+                now + HANDSHAKE_RETRY_INTERVAL,
+            )
+            .expect("timed retry");
+        assert_eq!(retry, first_request);
+
+        // The responder also returns its cached msg2 for the duplicate msg1,
+        // preserving one session even if packets are delayed or reordered.
+        let cached_response = responder
+            .cached_responder_response("peer", &retry)
+            .expect("cached response");
+        assert_eq!(cached_response, response_message);
+
+        let pending = initiator
+            .take_pending_init("peer")
+            .expect("pending initiator state");
+        let session = noise::initiator_finalize(
+            pending,
+            &initiator_static,
+            &responder_public,
+            &cached_response,
+        )
+        .expect("finalized retry");
+        assert_eq!(session.send_key, responder_recv_key);
+        assert_eq!(session.recv_key, responder_send_key);
+        initiator.store_initiator("peer", session);
+        assert!(!initiator.has_pending_init("peer"));
+        assert!(initiator.has_active_session("peer"));
+    }
+
+    #[test]
+    fn unspecified_configured_endpoint_requires_a_learned_peer_address() {
+        let state = PeerState::new();
+        let configured: SocketAddr = "0.0.0.0:27777".parse().unwrap();
+        assert_eq!(resolve_endpoint(&state, "peer", configured), None);
+        assert_eq!(
+            resolve_endpoint(&state, "peer", "[::]:27777".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            resolve_endpoint(&state, "peer", "203.0.113.10:0".parse().unwrap()),
+            None
+        );
+
+        let learned: SocketAddr = "198.51.100.24:45123".parse().unwrap();
+        state.record_keepalive("peer", learned);
+        assert_eq!(resolve_endpoint(&state, "peer", configured), Some(learned));
+    }
+
+    #[test]
+    fn routable_configured_endpoint_is_used_before_roaming_is_learned() {
+        let state = PeerState::new();
+        let configured: SocketAddr = "203.0.113.10:27777".parse().unwrap();
+        assert_eq!(
+            resolve_endpoint(&state, "peer", configured),
+            Some(configured)
+        );
+    }
 
     #[test]
     fn udp_rebind_becomes_due_after_inbound_silence() {

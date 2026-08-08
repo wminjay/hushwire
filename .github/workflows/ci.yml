@@ -20,7 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies (TUN support)
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        run: sudo apt-get update && sudo apt-get install -y build-essential iproute2 iputils-ping
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -33,3 +33,66 @@ jobs:
 
       - name: Test
         run: cargo test --release
+
+      - name: Test one-sided restart recovery in isolated network namespaces
+        run: sudo ./tests/recovery_netns.sh target/release/hushwire
+
+  macos-client:
+    name: Build & Test macOS Client
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-client-aarch64
+
+      - name: Test Swift client logic
+        run: swift test --package-path macos
+
+      - name: Validate control scripts
+        run: |
+          zsh -n macos/Resources/hushwire-control macos/scripts/build-app.sh
+          set +e
+          output=$(macos/Resources/hushwire-control status "$(id -u)")
+          result=$?
+          set -e
+          test "$result" -eq 3
+          test "$output" = "stopped"
+
+      - name: Build and verify Apple Silicon app bundle
+        env:
+          HUSHWIRE_RUST_TARGET: aarch64-apple-darwin
+          HUSHWIRE_SWIFT_ARCH: arm64
+        run: |
+          ./macos/scripts/build-app.sh
+          codesign --verify --deep --strict dist/HushWire.app
+          lipo -verify_arch arm64 dist/HushWire.app/Contents/MacOS/HushWire
+          lipo -verify_arch arm64 dist/HushWire.app/Contents/Resources/bin/hushwire
+          expected_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$(dist/HushWire.app/Contents/Resources/bin/hushwire --version)" = "hushwire $expected_version"
+
+      - name: Smoke-test privileged start and stop with no routes
+        run: |
+          test_directory=$(mktemp -d)
+          control="$PWD/dist/HushWire.app/Contents/Resources/bin/hushwire-control"
+          binary="$PWD/dist/HushWire.app/Contents/Resources/bin/hushwire"
+          log_file="$test_directory/tunnel.log"
+          touch "$log_file"
+          cleanup() {
+            sudo "$control" stop "$(id -u)" >/dev/null 2>&1 || true
+            rm -rf -- "$test_directory"
+          }
+          trap cleanup EXIT
+
+          sudo "$control" start "$(id -u)" "$binary" \
+            "$PWD/tests/fixtures/macos-no-routes.toml" "$log_file"
+          sudo "$control" status "$(id -u)" | grep -q '^running '
+          grep -q 'tunnel started' "$log_file"
+          sudo "$control" stop "$(id -u)"
+          test ! -e "/var/run/hushwire-$(id -u).pid"

@@ -23,6 +23,17 @@ sudo ./target/release/hushwire up -c my-node.toml
 ./target/release/hushwire doctor   -c my-node.toml
 ```
 
+## macOS Personal Client
+
+A native SwiftUI client for personal, direct-install use lives in [`macos/`](macos/README.md). It bundles the Rust tunnel binary and provides config selection, validation, key generation, connect/disconnect controls, and live logs.
+
+```sh
+./macos/scripts/build-app.sh
+open dist/HushWire.app
+```
+
+The local build uses an ad-hoc signature and macOS requests administrator authorization when starting or stopping the tunnel. It is not an App Store or Network Extension build.
+
 The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching configs (exchanged public keys + shared PSK) can ping each other's tunnel IPs once the transport port is reachable between them.
 
 ## Overview
@@ -117,9 +128,9 @@ persistent_keepalive = 25
 udp_rebind_after = 90
 ```
 
-With `udp_rebind_after` enabled, persistent keepalives become authenticated probes. The peer returns an authenticated acknowledgement, so the client can distinguish an idle tunnel from a broken return path. If no authenticated packet arrives for the configured number of seconds, HushWire binds a fresh ephemeral UDP source port and immediately sends a one-shot authenticated keepalive to every active peer—including peers with periodic keepalives disabled—so all learned endpoints move to the new port.
+With `udp_rebind_after` enabled, persistent keepalives become authenticated probes. The peer returns an authenticated acknowledgement, so the client can distinguish an idle tunnel from a broken return path. If no authenticated packet arrives for the configured number of seconds, HushWire binds a fresh ephemeral UDP source port, discards the timed-out peer's stale session, and starts a fresh Noise handshake. Because rebinding changes the interface-wide socket, it also sends a one-shot authenticated keepalive to every other active peer—including peers with periodic keepalives disabled—so their learned endpoints move to the new port.
 
-`udp_rebind_after` is disabled by default and must be greater than `persistent_keepalive`. Enable it on NATed clients, not on a public exit node: rebinding changes the interface-wide UDP socket and therefore the source port used for every peer on that interface. Both ends must support probe acknowledgements; older peers accept the keepalive but do not reply. A cold start still needs real tunnel traffic to initiate the Noise handshake.
+`udp_rebind_after` is disabled by default and must be greater than `persistent_keepalive`. Enable it on NATed clients, not on a public exit node: rebinding changes the interface-wide UDP socket and therefore the source port used for every peer on that interface. Both ends must support probe acknowledgements; older peers accept the keepalive but do not reply. A cold start still needs real tunnel traffic to initiate the Noise handshake, but an unanswered handshake is retried every five seconds without requiring more tunnel traffic.
 
 `faketcp` and `websocket` transports were considered and dropped: they add significant complexity without fitting HushWire's goal of being an observable, debuggable tunnel. The `PacketTransport` trait is designed so a new transport can be added without touching the data path.
 
