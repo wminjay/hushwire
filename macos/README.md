@@ -34,6 +34,8 @@ open dist/HushWire.app
 
 The result is `dist/HushWire.app`. It receives an ad-hoc local signature, which is sufficient for an app built and used on the same Mac. A Developer ID certificate and notarization would be needed before distributing it to other people.
 
+The v0.5.0 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
+
 ## Prepare a client configuration
 
 Use the app's **生成密钥** button (or `hushwire genkey`) to generate the client's private/public key pair. Generate a separate key pair on the peer. Generate the shared PSK once and copy it to both sides:

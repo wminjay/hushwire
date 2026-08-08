@@ -72,8 +72,8 @@ jobs:
         run: |
           ./macos/scripts/build-app.sh
           codesign --verify --deep --strict dist/HushWire.app
-          lipo -verify_arch arm64 dist/HushWire.app/Contents/MacOS/HushWire
-          lipo -verify_arch arm64 dist/HushWire.app/Contents/Resources/bin/hushwire
+          lipo dist/HushWire.app/Contents/MacOS/HushWire -verify_arch arm64
+          lipo dist/HushWire.app/Contents/Resources/bin/hushwire -verify_arch arm64
           expected_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$(dist/HushWire.app/Contents/Resources/bin/hushwire --version)" = "hushwire $expected_version"
 
