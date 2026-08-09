@@ -1,6 +1,6 @@
 # HushWire
 
-> **Status: experimental.** HushWire has not been audited. The Noise handshake provides forward secrecy, but the implementation is new and untested in adversarial conditions. Do not rely on it for sensitive traffic yet.
+> **Status: experimental.** HushWire has not been audited. v0.6.0 replaces the earlier custom cryptographic construction with the standard `snow` Noise state machine, but the complete tunnel remains untested in adversarial conditions. Do not rely on it for sensitive traffic yet.
 
 HushWire is an experimental WireGuard-like L3 tunnel focused on observability and debuggability.
 
@@ -34,6 +34,15 @@ open dist/HushWire.app
 
 The local build uses an ad-hoc signature and macOS requests administrator authorization when starting or stopping the tunnel. It is not an App Store or Network Extension build.
 
+The platform-independent Rust packet engine also exports a versioned C ABI for
+the in-progress Packet Tunnel System Extension. A universal macOS XCFramework
+and its Swift linkage smoke test can be built with:
+
+```sh
+macos/scripts/build-core-xcframework.sh
+macos/scripts/test-core-xcframework.sh
+```
+
 The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching configs (exchanged public keys + shared PSK) can ping each other's tunnel IPs once the transport port is reachable between them.
 
 ## Overview
@@ -41,7 +50,7 @@ The daemon creates a TUN interface, installs host routes, and tears everything d
 - create a TUN interface
 - read IPv4 packets from it
 - route packets by longest-prefix match against peer `allowed_ips`
-- **Noise_IKpsk2 handshake** with ephemeral keys → forward secrecy (PFS)
+- standard **Noise_IKpsk2** state machine (`snow`) with ephemeral keys → forward secrecy (PFS)
 - encrypt and authenticate each data packet with ChaCha20-Poly1305 using a session key
 - anti-replay protection per session
 - send packets over a pluggable packet transport (UDP or TCP)
@@ -53,7 +62,7 @@ The daemon creates a TUN interface, installs host routes, and tears everything d
 
 ## Packet Security
 
-HushWire uses a Noise_IKpsk2 handshake (same family as WireGuard) to negotiate ephemeral session keys. Data is encrypted with ChaCha20-Poly1305 under the session key, **not** the static PSK. This provides **forward secrecy**: even if the PSK or static private key is compromised later, previously captured traffic cannot be decrypted (session keys are ephemeral and destroyed after use).
+HushWire v0.6 uses `snow`'s standard `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` state machine to negotiate ephemeral session keys. Data is encrypted with ChaCha20-Poly1305 under the resulting transport keys, **not** directly with the static PSK. The ephemeral exchange provides forward secrecy for completed sessions.
 
 The PSK serves only as an authentication factor — it's mixed into the key derivation at the end of the handshake to verify both peers are authorized, but never directly encrypts data.
 
@@ -67,31 +76,30 @@ hushwire genkey
 
 ### Handshake
 
-On-wire handshake (2 messages, 3 Diffie-Hellman operations):
-
-```text
-  Initiator                         Responder
-  msg1: eph_i_pub + PSK(static_i)   →
-                                   ←  msg2: eph_r_pub + PSK(session_id)
-  both derive: keys = HKDF(DH1 || DH2 || DH3 || psk)
-```
+The two handshake messages are produced and consumed by the standard Noise IKpsk2 state machine. The responder verifies that the static public key revealed by Noise exactly matches the configured `public_key`; the initiator already pins the responder's configured static key. The PSK is mixed at Noise position 2. A responder keeps a newly derived session as a candidate until the initiator sends the first authenticated transport packet, so replaying an old handshake initiation cannot immediately replace a working session.
 
 ### Data packet layout
 
 ```text
   offset  size  field
-  0       1     version    (0x02)
-  1       1     msg_type   (0x00=data, 0x01=keepalive, 0x02=handshake_init, 0x03=handshake_response)
-  2..10   8     session_id (identifies which session key to use)
-  10..14  4     nonce_rand (random, completes the 12-byte AEAD nonce)
-  14..    N     ciphertext + 16-byte Poly1305 tag
+  0       1     version     (0x03)
+  1       1     packet_kind (0x00=transport, 0x01=handshake_init, 0x02=handshake_response)
+  2..10   8     session_id  (identifies the transport session)
+  10..18  8     counter     (big-endian monotonic u64 AEAD nonce)
+  18..    N     Noise ciphertext + 16-byte Poly1305 tag
 ```
 
-`version || msg_type` is bound into the AEAD as additional authenticated data, so the header cannot be tampered with without failing decryption. The 12-byte AEAD nonce = `session_id(8) || nonce_rand(4)`. The receiver uses `session_id` to look up the correct session key, then decrypts.
+Handshake packets use the shorter `version || packet_kind || handshake_id` header followed by a Noise handshake message. The version and random handshake ID are bound into the Noise prologue, so changing either breaks the transcript.
 
-Each peer keeps a bounded FIFO of recently seen nonces per session (default 4096 entries) and drops any packet whose nonce has already been seen, so a captured ciphertext cannot be replayed. The replay filter is reset when a new session is established (rekey). Fresh nonces collide inside the window with negligible (~2^-48) probability.
+Each transport direction starts its counter at zero and increments it once per encryption; no randomness is used for the nonce, so packets under one key cannot collide. The data/keepalive message type is inside the authenticated ciphertext. Receivers use a 4096-counter sliding window, accept legitimate reordering, reject duplicates and packets older than the window, and advance the window only after the AEAD tag authenticates. A forged high counter therefore cannot move the window.
 
-Keepalive packets use an empty encrypted payload for legacy one-way keepalives, `0x01` for an active liveness probe, and `0x02` for its acknowledgement.
+Sessions begin a replacement handshake after 120 seconds or 2^32 messages and stop being accepted after 180 seconds. The old session continues carrying traffic while the replacement is negotiated, avoiding an intentional gap during normal rekey.
+
+Keepalive packets use an empty encrypted payload for one-way keepalives, `0x01` for an active liveness probe, and `0x02` for its acknowledgement.
+
+### v0.6 compatibility
+
+Wire protocol v3 is intentionally incompatible with v0.5.1 and earlier. Both ends of a peer link must be upgraded together. The TOML shape is unchanged for a single peer, but a multi-peer interface must give every peer a unique PSK and unique static `public_key`; duplicate credentials are rejected during `check`/startup.
 
 ## Transport Strategy
 
@@ -147,7 +155,7 @@ udp_rebind_after = 90
 
 With `udp_rebind_after` enabled, persistent keepalives become authenticated probes. The peer returns an authenticated acknowledgement, so the client can distinguish an idle tunnel from a broken return path. If no authenticated packet arrives for the configured number of seconds, HushWire binds a fresh ephemeral UDP source port, discards the timed-out peer's stale session, and starts a fresh Noise handshake. Because rebinding changes the interface-wide socket, it also sends a one-shot authenticated keepalive to every other active peer—including peers with periodic keepalives disabled—so their learned endpoints move to the new port.
 
-`udp_rebind_after` is disabled by default and must be greater than `persistent_keepalive`. Enable it on NATed clients, not on a public exit node: rebinding changes the interface-wide UDP socket and therefore the source port used for every peer on that interface. Both ends must support probe acknowledgements; older peers accept the keepalive but do not reply. A cold start still needs real tunnel traffic to initiate the Noise handshake, but an unanswered handshake is retried every five seconds without requiring more tunnel traffic.
+`udp_rebind_after` is disabled by default and must be greater than `persistent_keepalive`. Enable it on NATed clients, not on a public exit node: rebinding changes the interface-wide UDP socket and therefore the source port used for every peer on that interface. Both ends must run the v3 wire protocol. Real tunnel traffic starts a cold handshake immediately; a configured periodic keepalive can also start it when its interval becomes due. An unanswered exchange is retried every five seconds and replaced with a fresh handshake after 30 seconds.
 
 `faketcp` and `websocket` transports were considered and dropped: they add significant complexity without fitting HushWire's goal of being an observable, debuggable tunnel. The `PacketTransport` trait is designed so a new transport can be added without touching the data path.
 

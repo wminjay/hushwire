@@ -30,7 +30,10 @@ read_pid() {
 
 is_running() {
     local process_id="$1"
-    /bin/kill -0 "$process_id" >/dev/null 2>&1
+    local observed_pid
+    observed_pid="$(/bin/ps -p "$process_id" -o pid= 2>/dev/null)" || return 1
+    observed_pid="${observed_pid//[[:space:]]/}"
+    [[ "$observed_pid" == "$process_id" ]]
 }
 
 is_managed_process() {
@@ -75,7 +78,7 @@ case "$action" in
         # descriptor inherited from the authorization subprocess.
         (
             trap - HUP INT TERM
-            exec "$binary_path" --log-format text up --config "$config_path"
+            exec "$binary_path" --log-format text --detach-session up --config "$config_path"
         ) >>"$log_path" 2>&1 </dev/null &!
         process_id=$!
 

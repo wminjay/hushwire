@@ -1,71 +1,115 @@
-use std::collections::{HashMap, VecDeque};
+//! Counter-based anti-replay protection for Noise transport messages.
+//!
+//! Every direction of a v3 session uses a monotonically increasing `u64`
+//! counter as its AEAD nonce. The receiver remembers a sliding window so a
+//! packet may arrive out of order, but an authenticated counter can never be
+//! accepted twice.
 
-use crate::auth::NONCE_SIZE;
+pub const DEFAULT_WINDOW_SIZE: usize = 4096;
+const WORD_BITS: usize = u64::BITS as usize;
+const WINDOW_WORDS: usize = DEFAULT_WINDOW_SIZE / WORD_BITS;
 
-/// Default number of recent nonces kept per peer. Picked to cover typical
-/// bursts of replayed traffic while bounding per-peer memory (~48 KB for the
-/// map plus the deque of fixed-size keys).
-const DEFAULT_CAPACITY: usize = 4096;
-
-/// A bounded FIFO set of recently seen AEAD nonces.
-///
-/// `HushWire` uses random 96-bit nonces (see `auth::encode_packet`), so the
-/// classic counter-based sliding window used by WireGuard does not apply.
-/// Instead each peer keeps the most recent `capacity` nonces and rejects any
-/// packet whose nonce is already in the set. Nonces older than `capacity`
-/// packets ago are evicted and would theoretically be replayable; this matches
-/// the bounded-window trade-off of other tunnel implementations.
-///
-/// Random 96-bit nonces collide within the window with negligible probability
-/// (~2^-48 at the boundary), so a fresh nonce is essentially never misjudged as
-/// a replay.
-pub struct ReplayFilter {
-    capacity: usize,
-    seen: HashMap<[u8; NONCE_SIZE], ()>,
-    order: VecDeque<[u8; NONCE_SIZE]>,
+/// A 4096-packet replay window. Bit zero represents `highest`, bit one
+/// `highest - 1`, and so on.
+#[derive(Clone)]
+pub struct ReplayWindow {
+    highest: Option<u64>,
+    bits: [u64; WINDOW_WORDS],
 }
 
-impl ReplayFilter {
+impl ReplayWindow {
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_CAPACITY)
-    }
-
-    /// Build a filter with a custom window size. Mainly used by tests.
-    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            capacity,
-            seen: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
+            highest: None,
+            bits: [0; WINDOW_WORDS],
         }
     }
 
-    /// Record a nonce. Returns `true` if the nonce was fresh (and has now been
-    /// inserted), or `false` if it was already in the window and is therefore a
-    /// replay.
-    ///
-    /// The check and insert happen atomically within this call, so the filter
-    /// stays correct even if it were ever shared across threads behind a lock.
-    pub fn check_and_insert(&mut self, nonce: &[u8; NONCE_SIZE]) -> bool {
-        // Capacity 0 is degenerate: retain nothing, so every packet is treated
-        // as fresh.
-        if self.capacity == 0 {
+    /// Cheap pre-authentication check. This never mutates state: a forged
+    /// packet with a very large counter therefore cannot advance the window
+    /// and discard legitimate packets.
+    pub fn would_accept(&self, counter: u64) -> bool {
+        let Some(highest) = self.highest else {
+            return true;
+        };
+        if counter > highest {
             return true;
         }
-        if self.seen.contains_key(nonce) {
+
+        let distance = highest - counter;
+        if distance >= DEFAULT_WINDOW_SIZE as u64 {
             return false;
         }
-        if self.order.len() == self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.seen.remove(&oldest);
+        !self.bit_is_set(distance as usize)
+    }
+
+    /// Record a counter only after its AEAD tag has authenticated. Returns
+    /// false if another thread/path already recorded it or it is too old.
+    pub fn mark_authenticated(&mut self, counter: u64) -> bool {
+        if !self.would_accept(counter) {
+            return false;
+        }
+
+        match self.highest {
+            None => {
+                self.highest = Some(counter);
+                self.bits[0] = 1;
+            }
+            Some(highest) if counter > highest => {
+                self.shift_older(counter - highest);
+                self.highest = Some(counter);
+                self.bits[0] |= 1;
+            }
+            Some(highest) => {
+                self.set_bit((highest - counter) as usize);
             }
         }
-        self.order.push_back(*nonce);
-        self.seen.insert(*nonce, ());
         true
+    }
+
+    #[cfg(test)]
+    fn highest(&self) -> Option<u64> {
+        self.highest
+    }
+
+    fn bit_is_set(&self, distance: usize) -> bool {
+        let word = distance / WORD_BITS;
+        let bit = distance % WORD_BITS;
+        self.bits[word] & (1u64 << bit) != 0
+    }
+
+    fn set_bit(&mut self, distance: usize) {
+        let word = distance / WORD_BITS;
+        let bit = distance % WORD_BITS;
+        self.bits[word] |= 1u64 << bit;
+    }
+
+    fn shift_older(&mut self, amount: u64) {
+        if amount >= DEFAULT_WINDOW_SIZE as u64 {
+            self.bits.fill(0);
+            return;
+        }
+
+        let amount = amount as usize;
+        let word_shift = amount / WORD_BITS;
+        let bit_shift = amount % WORD_BITS;
+        let old = self.bits;
+        self.bits.fill(0);
+
+        for (source_word, value) in old.into_iter().enumerate() {
+            let destination_word = source_word + word_shift;
+            if destination_word >= WINDOW_WORDS {
+                break;
+            }
+            self.bits[destination_word] |= value << bit_shift;
+            if bit_shift != 0 && destination_word + 1 < WINDOW_WORDS {
+                self.bits[destination_word + 1] |= value >> (WORD_BITS - bit_shift);
+            }
+        }
     }
 }
 
-impl Default for ReplayFilter {
+impl Default for ReplayWindow {
     fn default() -> Self {
         Self::new()
     }
@@ -75,58 +119,56 @@ impl Default for ReplayFilter {
 mod tests {
     use super::*;
 
-    fn nonce(byte: u8) -> [u8; NONCE_SIZE] {
-        [byte; NONCE_SIZE]
+    #[test]
+    fn accepts_first_new_and_out_of_order_counters_once() {
+        let mut window = ReplayWindow::new();
+        assert!(window.mark_authenticated(10));
+        assert!(window.mark_authenticated(12));
+        assert!(window.mark_authenticated(11));
+        assert!(!window.mark_authenticated(10));
+        assert!(!window.mark_authenticated(11));
+        assert!(!window.mark_authenticated(12));
     }
 
     #[test]
-    fn accepts_fresh_nonce() {
-        let mut filter = ReplayFilter::new();
-        assert!(filter.check_and_insert(&nonce(1)));
+    fn rejects_counters_older_than_the_window() {
+        let mut window = ReplayWindow::new();
+        assert!(window.mark_authenticated(0));
+        assert!(window.mark_authenticated(DEFAULT_WINDOW_SIZE as u64));
+        assert!(!window.would_accept(0));
+        assert!(!window.mark_authenticated(0));
+        assert!(window.mark_authenticated(1));
     }
 
     #[test]
-    fn rejects_duplicate_nonce() {
-        let mut filter = ReplayFilter::new();
-        assert!(filter.check_and_insert(&nonce(1)));
-        assert!(!filter.check_and_insert(&nonce(1)));
+    fn large_jump_clears_old_history() {
+        let mut window = ReplayWindow::new();
+        assert!(window.mark_authenticated(20));
+        assert!(window.mark_authenticated(10_000));
+        assert_eq!(window.highest(), Some(10_000));
+        assert!(!window.would_accept(20));
+        assert!(window.mark_authenticated(9_999));
     }
 
     #[test]
-    fn evicts_oldest_beyond_capacity() {
-        // A full window must still accept a fresh, distinct nonce: that can
-        // only happen if the oldest entry is evicted rather than the new one
-        // being rejected.
-        let mut filter = ReplayFilter::with_capacity(3);
-        assert!(filter.check_and_insert(&nonce(1)));
-        assert!(filter.check_and_insert(&nonce(2)));
-        assert!(filter.check_and_insert(&nonce(3)));
-        // Window is full; a 4th distinct nonce is still accepted (oldest
-        // evicted), not rejected as if the window were closed.
-        assert!(filter.check_and_insert(&nonce(4)));
-        // The remaining in-window duplicates are rejected.
-        assert!(!filter.check_and_insert(&nonce(2)));
-        assert!(!filter.check_and_insert(&nonce(4)));
+    fn unauthenticated_precheck_does_not_advance_window() {
+        let mut window = ReplayWindow::new();
+        assert!(window.mark_authenticated(50));
+        assert!(window.would_accept(u64::MAX));
+        assert_eq!(window.highest(), Some(50));
+        assert!(window.mark_authenticated(49));
     }
 
     #[test]
-    fn capacity_plus_one_distinct_nonces_all_accepted() {
-        let mut filter = ReplayFilter::with_capacity(4);
-        for i in 0..4 {
-            assert!(
-                filter.check_and_insert(&nonce(i)),
-                "nonce {i} should be fresh"
-            );
+    fn shifts_across_word_and_window_boundaries() {
+        let mut window = ReplayWindow::new();
+        for counter in [0, 1, 63, 64, 65, 4094, 4095] {
+            assert!(window.mark_authenticated(counter));
         }
-        // Distinct nonce beyond capacity: accepted, oldest evicted.
-        assert!(filter.check_and_insert(&nonce(200)));
-    }
-
-    #[test]
-    fn zero_capacity_accepts_everything() {
-        let mut filter = ReplayFilter::with_capacity(0);
-        assert!(filter.check_and_insert(&nonce(1)));
-        // Even an identical nonce is re-accepted because nothing is retained.
-        assert!(filter.check_and_insert(&nonce(1)));
+        assert!(window.mark_authenticated(4096));
+        assert!(!window.would_accept(0));
+        for counter in [1, 63, 64, 65, 4094, 4095, 4096] {
+            assert!(!window.would_accept(counter), "counter {counter}");
+        }
     }
 }

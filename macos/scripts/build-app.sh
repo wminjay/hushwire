@@ -5,7 +5,8 @@ set -euo pipefail
 script_directory="${0:A:h}"
 macos_directory="${script_directory:h}"
 repository_root="${macos_directory:h}"
-output_directory="${repository_root}/dist"
+output_directory="${HUSHWIRE_OUTPUT_DIRECTORY:-${repository_root}/dist}"
+output_directory="${output_directory:A}"
 application_path="${output_directory}/HushWire.app"
 rust_target="${HUSHWIRE_RUST_TARGET:-}"
 swift_architecture="${HUSHWIRE_SWIFT_ARCH:-}"
@@ -16,10 +17,10 @@ if [[ -n "$rust_target" && -z "$swift_architecture" ]] \
     exit 2
 fi
 
-case "$application_path" in
-    "${repository_root}/dist/HushWire.app") ;;
+case "$output_directory" in
+    "${repository_root}/dist" | "${repository_root}/dist/"*) ;;
     *)
-        print -u2 -- "Refusing to replace unexpected application path: $application_path"
+        print -u2 -- "HUSHWIRE_OUTPUT_DIRECTORY must be dist or one of its subdirectories: $output_directory"
         exit 1
         ;;
 esac

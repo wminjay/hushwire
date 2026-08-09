@@ -2,9 +2,8 @@ use std::net::IpAddr;
 use std::process::Command;
 
 use anyhow::Context;
-
-use crate::config::Config;
-use crate::router::Router;
+use hushwire::config::Config;
+use hushwire::router::Router;
 
 pub fn run(config: &Config, router: &Router, exit_node: bool) -> anyhow::Result<()> {
     println!("HushWire doctor");
