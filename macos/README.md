@@ -72,10 +72,24 @@ HUSHWIRE_SIGNING=development macos/scripts/build-system-extension.sh
 The development build is written below
 `dist/DerivedData/HushWireSystemSigned/Build/Products/Debug/HushWire.app`. The
 build command does not install or activate the extension. First activation must
-be initiated from the app and approved in macOS System Settings. This preview
-intentionally rejects tunnel startup before calling
-`setTunnelNetworkSettings`, so its lifecycle test cannot add routes or change
-DNS.
+be initiated from the app and approved in macOS System Settings.
+
+The System Extension defaults to the `host-routes-only` policy. In that mode it
+only accepts `/32` entries from `allowed_ips`, leaves the default route and DNS
+unchanged, and requires `interface.listen` to use port `0` so macOS can manage
+the local socket.
+
+The opt-in `full-tunnel-v1` policy is deliberately narrower than the CLI. It
+accepts one peer with one `0.0.0.0/0` route, requires authenticated keepalive
+recovery settings, and installs the peer endpoint as an excluded `/32` route so
+the encrypted transport cannot recursively enter its own tunnel. IPv4 DNS
+servers can be entered separately in the app; leaving the field empty preserves
+the system DNS configuration. The app requires an additional confirmation for
+every full-tunnel start, and the provider rejects starts that bypass that
+confirmation. It also completes an authenticated handshake before installing
+the default route or DNS; a 15-second preflight timeout leaves the existing
+network settings untouched. Test this mode on an isolated machine before using
+it for a primary network path.
 
 The v0.6.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
 

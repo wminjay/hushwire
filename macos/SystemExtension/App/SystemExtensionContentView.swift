@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct SystemExtensionContentView: View {
   @ObservedObject var controller: SystemExtensionController
   @State private var isImportingConfiguration = false
+  @State private var isConfirmingFullTunnelConnection = false
 
   var body: some View {
     ScrollView(.vertical) {
@@ -16,7 +17,7 @@ struct SystemExtensionContentView: View {
           VStack(alignment: .leading, spacing: 2) {
             Text("HushWire System Extension")
               .font(.title2.weight(.semibold))
-            Text("0.7.0 开发预览 · /32 Packet Flow 阶段")
+            Text("0.7.0 开发预览 · 受控网络策略阶段")
               .foregroundStyle(.secondary)
           }
           Spacer()
@@ -46,9 +47,45 @@ struct SystemExtensionContentView: View {
           .padding(.top, 3)
         }
 
+        GroupBox("网络策略") {
+          VStack(alignment: .leading, spacing: 10) {
+            Picker(
+              "路由模式",
+              selection: Binding(
+                get: { controller.selectedRoutePolicy },
+                set: { controller.selectRoutePolicy($0) }
+              )
+            ) {
+              ForEach(HushWireRoutePolicy.allCases) { policy in
+                Text(policy.title).tag(policy)
+              }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!controller.canEditNetworkPolicy)
+
+            Text(controller.selectedRoutePolicy.detail)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+
+            LabeledContent("DNS 服务器") {
+              TextField("留空则保持系统 DNS；例如 1.1.1.1, 1.0.0.1", text: $controller.dnsServersText)
+                .textFieldStyle(.roundedBorder)
+                .disabled(
+                  !controller.canEditNetworkPolicy || !controller.isFullTunnelSelected
+                )
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.top, 3)
+        }
+
         GroupBox("隧道配置（不显示密钥）") {
           if let summary = controller.configurationSummary {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+              GridRow {
+                Text("模式").foregroundStyle(.secondary)
+                Text(summary.routePolicy.title)
+              }
               GridRow {
                 Text("接口").foregroundStyle(.secondary)
                 Text(summary.interface).font(.system(.body, design: .monospaced))
@@ -67,10 +104,15 @@ struct SystemExtensionContentView: View {
                 Text(summary.routeDescription)
                   .font(.system(.body, design: .monospaced))
               }
+              GridRow {
+                Text("DNS").foregroundStyle(.secondary)
+                Text(summary.dnsDescription)
+                  .font(.system(.body, design: .monospaced))
+              }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
           } else {
-            Text("尚未导入配置。当前阶段只接受 /32 主机路由和本地端口 0。")
+            Text("尚未导入与当前网络策略匹配的配置；本地监听端口必须为 0。")
               .foregroundStyle(.secondary)
               .frame(maxWidth: .infinity, alignment: .leading)
           }
@@ -124,7 +166,11 @@ struct SystemExtensionContentView: View {
           Spacer()
 
           Button(connectButtonTitle) {
-            controller.startTunnel()
+            if controller.isFullTunnelSelected {
+              isConfirmingFullTunnelConnection = true
+            } else {
+              controller.startTunnel()
+            }
           }
           .buttonStyle(.borderedProminent)
           .disabled(
@@ -150,7 +196,7 @@ struct SystemExtensionContentView: View {
         }
 
         Label(
-          "安全边界：仅安装 TOML 中的 /32 路由；不设置 0.0.0.0/0、不修改 DNS，也不运行提权脚本。",
+          safetyBoundaryText,
           systemImage: "checkmark.shield"
         )
         .font(.caption)
@@ -176,6 +222,16 @@ struct SystemExtensionContentView: View {
         _ = error
       }
     }
+    .alert("确认启用 IPv4 全隧道？", isPresented: $isConfirmingFullTunnelConnection) {
+      Button("取消", role: .cancel) {}
+      Button("连接并接管 IPv4 流量", role: .destructive) {
+        controller.startTunnel()
+      }
+    } message: {
+      Text(
+        "此操作会把 IPv4 默认路由交给 HushWire。客户端会为 Peer endpoint 保留直连例外；DNS 是否修改取决于上方设置。请仅在已验证的服务端和可恢复网络环境中使用。"
+      )
+    }
   }
 
   private var connectButtonTitle: String {
@@ -189,5 +245,12 @@ struct SystemExtensionContentView: View {
     default:
       return "连接"
     }
+  }
+
+  private var safetyBoundaryText: String {
+    if controller.isFullTunnelSelected {
+      return "全隧道边界：仅接受单 Peer 的 0.0.0.0/0；自动直连排除 endpoint；仅在显式填写时修改 DNS；不运行提权脚本。"
+    }
+    return "主机路由边界：仅安装 TOML 中的 /32 路由；不设置默认路由、不修改 DNS，也不运行提权脚本。"
   }
 }

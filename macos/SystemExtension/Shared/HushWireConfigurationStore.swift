@@ -3,7 +3,6 @@ import Foundation
 enum HushWireConfigurationStore {
   static let appGroupIdentifier = "95Q852BXKJ.com.jamie.HushWire.shared"
   static let providerStorageKind = "app-group-v1"
-  static let routePolicy = "host-routes-only"
 
   private static let directoryComponents = ["Library", "Application Support", "HushWire"]
   private static let configurationFileName = "active.toml"
