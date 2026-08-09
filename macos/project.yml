@@ -36,7 +36,7 @@ targets:
     settings:
       base:
         CODE_SIGN_ENTITLEMENTS: SystemExtension/App/HushWire.entitlements
-        CURRENT_PROJECT_VERSION: 6
+        CURRENT_PROJECT_VERSION: 7
         INFOPLIST_FILE: SystemExtension/App/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: com.jamie.HushWire
         PRODUCT_NAME: HushWire

@@ -1,5 +1,7 @@
 use std::net::IpAddr;
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use anyhow::Context;
 use hushwire::router::Router;
@@ -132,15 +134,7 @@ fn add_route_to_dev(prefix: &str, dev: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn del_tun_route(prefix: &str, dev: &str) -> anyhow::Result<()> {
-    let output = Command::new("ip")
-        .args(["route", "del", prefix, "dev", dev])
-        .output()
-        .context("running ip route del")?;
-    if output.status.success() || !linux_route_exists(prefix, Some(dev))? {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    anyhow::bail!("ip route del failed: {}", stderr.trim());
+    delete_linux_route(&["route", "del", prefix, "dev", dev], prefix, Some(dev))
 }
 
 #[cfg(target_os = "linux")]
@@ -169,15 +163,55 @@ fn add_host_route_dev(host: &str, dev: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn del_host_route(host: &str) -> anyhow::Result<()> {
-    let output = Command::new("ip")
-        .args(["route", "del", host])
-        .output()
-        .context("running ip route del host")?;
-    if output.status.success() || !linux_route_exists(host, None)? {
-        return Ok(());
+    delete_linux_route(&["route", "del", host], host, None)
+}
+
+#[cfg(target_os = "linux")]
+fn delete_linux_route(arguments: &[&str], prefix: &str, dev: Option<&str>) -> anyhow::Result<()> {
+    // systemd's default KillMode=control-group can race with shutdown cleanup:
+    // an `ip` child spawned while systemd is enumerating the cgroup may inherit
+    // the unit's SIGTERM and exit without stderr. A short bounded retry runs
+    // after that enumeration while still requiring the exact route to vanish.
+    const ATTEMPTS: usize = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    let mut last_failure = None;
+    let mut last_check_error = None;
+    for attempt in 0..ATTEMPTS {
+        let output = Command::new("ip")
+            .args(arguments)
+            .output()
+            .context("running ip route del")?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        match linux_route_exists(prefix, dev) {
+            Ok(false) => return Ok(()),
+            Ok(true) => last_check_error = None,
+            Err(error) => last_check_error = Some(error),
+        }
+        last_failure = Some(output);
+
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
     }
+
+    let output = last_failure.expect("route deletion attempted at least once");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    anyhow::bail!("ip route del host failed: {}", stderr.trim());
+    let detail = if stderr.trim().is_empty() {
+        "no stderr".to_string()
+    } else {
+        stderr.trim().to_string()
+    };
+    if let Some(error) = last_check_error {
+        anyhow::bail!(
+            "ip route del failed ({}, {detail}); final route check failed: {error}",
+            output.status
+        );
+    }
+    anyhow::bail!("ip route del failed ({}, {detail})", output.status);
 }
 
 #[cfg(target_os = "linux")]

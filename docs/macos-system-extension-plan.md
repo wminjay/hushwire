@@ -45,7 +45,7 @@ HushWire 使用 Network Extension 框架中的 `NEPacketTunnelProvider`，并在
 
 ## 当前基线
 
-- Rust crate 版本：`0.6.0`。
+- Rust crate 版本：`0.6.1`。
 - macOS GUI：SwiftPM executable，手工组装 `.app`。
 - 当前签名：ad-hoc。
 - 当前启动链：`HushWire.app -> osascript -> authtrampoline -> hushwire-control -> hushwire`。
@@ -215,7 +215,10 @@ API 最小集合：
 - Apple Development 签名的 build 5 已完成原位升级，并通过隔离的 `10.77.60.1/32` 实例验证真实握手、双向 packet flow、正常连接/断开及接口与路由完整清理；默认路由、DNS、Tailscale 和生产 `27777`/`27779` 实例全程未变。
 - UDP 与 TCP 均完成 64 MiB 双向传输并校验 SHA-256；TCP 在持续下载下发现的非阻塞短写问题已改为有界的完整帧待写队列，修复后未再出现 `EAGAIN` 导致的帧流损坏。
 - 已跨越 120 秒自动 rekey 连续 Ping：换钥边界前后数据包连续，服务端只完成一次 responder 握手，没有重复会话、解密或认证错误。此前旧会话在 initiator 立即替换时丢弃在途包的问题，已通过 receive-only previous-session grace 修复。
-- 服务端使用最终核心重启时，路由清理没有再出现 `failed to delete route`；隔离实例恢复监听且两个生产实例保持 active。
+- App build 7 会在启动时通过 System Extensions properties API 恢复扩展真实状态；已验证连接中退出、重开和仅替换容器 App 均不重启 provider、不打断数据面，UI 能恢复 VPN、配置和实时会话。
+- `/32` 安全策略已提取为共享校验层并由 Swift smoke test 覆盖，明确拒绝子网/默认路由、固定本地监听端口及无 Peer 路由配置，拒绝发生在安装 VPN settings 之前。
+- 已验证服务端先不可达时 UI 显示 endpoint 未确认和从未收到认证流量；服务恢复后立即自动握手。已连接状态下停止服务约 36 秒后，恢复服务约 4.2 秒完成新握手、约 5–6 秒恢复数据。
+- Linux systemd 停止时发现 `KillMode=control-group` 可能波及临时 `ip route del` 子进程；v0.6.1 加入短时有界重试并保持最终精确路由检查，隔离实例连续三轮 start/stop 均无清理警告和残留路由，两个生产实例保持 active。
 - 待完成：sleep/wake、网络切换、扩展崩溃/升级、长时间运行、全隧道、DNS 与直接分发验收。
 
 验收顺序：
