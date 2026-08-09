@@ -109,12 +109,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       }
       self.logger.info("Packet Tunnel stopping; reason=\(reason.rawValue)")
       self.tearDownRuntime()
-      self.setTunnelNetworkSettings(nil) { error in
-        if let error {
-          self.logger.error("Failed to clear tunnel settings: \(error.localizedDescription)")
-        }
-        completionHandler()
-      }
+      // The system tears down the virtual interface and its routes when the
+      // provider finishes stopTunnel. Trying to replace the network settings
+      // with nil while that teardown is already under way races the system on
+      // macOS and can report a spurious "Device not configured" error even
+      // though the routes and DNS have been removed successfully.
+      completionHandler()
     }
   }
 
