@@ -28,6 +28,7 @@ swiftc \
   -framework Network \
   -o "$test_directory/HushWireSystemExtensionCoreSmoke" \
   "$repository_root/macos/SystemExtension/Shared/HushWireCoreRuntime.swift" \
+  "$repository_root/macos/SystemExtension/Shared/HushWireConfigurationPolicy.swift" \
   "$repository_root/macos/Core/Tests/SystemExtensionCoreSmoke.swift"
 
 "$test_directory/HushWireSystemExtensionCoreSmoke"

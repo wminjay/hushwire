@@ -77,7 +77,7 @@ intentionally rejects tunnel startup before calling
 `setTunnelNetworkSettings`, so its lifecycle test cannot add routes or change
 DNS.
 
-The v0.6.0 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
+The v0.6.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
 
 ## Prepare a client configuration
 

@@ -5,36 +5,23 @@ import SystemExtensions
 
 enum SystemExtensionInstallationState: Equatable {
   case unknown
+  case notInstalled
   case requesting
   case awaitingApproval
   case installed
+  case uninstalling
   case failed(String)
 
   var title: String {
     switch self {
     case .unknown: "尚未检查"
+    case .notInstalled: "未激活"
     case .requesting: "正在提交安装请求"
     case .awaitingApproval: "等待系统设置批准"
     case .installed: "扩展已激活"
+    case .uninstalling: "正在卸载"
     case .failed(let message): "失败：\(message)"
     }
-  }
-}
-
-struct HushWireConfigurationSummary: Equatable {
-  let interface: String
-  let transport: String
-  let mtu: UInt16
-  let peerCount: Int
-  let routes: [String]
-  let endpoints: [String]
-
-  var routeDescription: String {
-    routes.joined(separator: ", ")
-  }
-
-  var endpointDescription: String {
-    endpoints.joined(separator: ", ")
   }
 }
 
@@ -75,6 +62,7 @@ final class SystemExtensionController: NSObject, ObservableObject {
   private var statusObserver: NSObjectProtocol?
   private var providerPollTimer: DispatchSourceTimer?
   private var configurationDeliveryInFlight = false
+  private var propertiesRequest: OSSystemExtensionRequest?
 
   override init() {
     super.init()
@@ -92,6 +80,7 @@ final class SystemExtensionController: NSObject, ObservableObject {
         self.refreshProviderStatus()
       }
     }
+    refreshSystemExtensionStatus()
     refreshStagedConfiguration(reportFailure: false)
     loadSavedConfiguration(reportResult: false)
     let timer = DispatchSource.makeTimerSource(queue: .main)
@@ -133,6 +122,16 @@ final class SystemExtensionController: NSObject, ObservableObject {
       forExtensionWithIdentifier: SystemExtensionConstants.extensionBundleIdentifier,
       queue: .main
     )
+    request.delegate = self
+    OSSystemExtensionManager.shared.submitRequest(request)
+  }
+
+  private func refreshSystemExtensionStatus() {
+    let request = OSSystemExtensionRequest.propertiesRequest(
+      forExtensionWithIdentifier: SystemExtensionConstants.extensionBundleIdentifier,
+      queue: .main
+    )
+    propertiesRequest = request
     request.delegate = self
     OSSystemExtensionManager.shared.submitRequest(request)
   }
@@ -218,32 +217,7 @@ final class SystemExtensionController: NSObject, ObservableObject {
   }
 
   private func inspectConfiguration(_ data: Data) throws -> HushWireConfigurationSummary {
-    let runtime = try HushWireCoreRuntime(configuration: data)
-    let interface = try runtime.interfaceMetadata()
-    let routes = try runtime.routes()
-    guard !routes.isEmpty else {
-      throw HushWireCoreError.operation("配置没有 Peer 路由。")
-    }
-    guard routes.allSatisfy({ $0.prefixLength == 32 }) else {
-      throw HushWireCoreError.operation(
-        "当前安全测试阶段只接受 /32 主机路由，不接受子网或默认路由。"
-      )
-    }
-    guard interface.listen.port == 0 else {
-      throw HushWireCoreError.operation(
-        "当前 macOS 客户端要求 interface.listen 使用端口 0。"
-      )
-    }
-    let peerNames = Set(routes.map(\.peerName))
-    let endpoints = Array(Set(routes.map { $0.endpoint.displayString })).sorted()
-    return HushWireConfigurationSummary(
-      interface: interface.cidr,
-      transport: interface.transport.title,
-      mtu: interface.mtu,
-      peerCount: peerNames.count,
-      routes: routes.map(\.cidr),
-      endpoints: endpoints
-    )
+    try HushWireHostRouteConfigurationPolicy.inspect(data)
   }
 
   private func refreshProviderStatus() {
@@ -376,6 +350,8 @@ final class SystemExtensionController: NSObject, ObservableObject {
             self.isBusy = false
             if reportResult {
               self.activity = "VPN 配置已存在，并已重新载入系统状态。"
+            } else if self.vpnStatus == .connected || self.vpnStatus == .reasserting {
+              self.activity = "已从 macOS 恢复现有连接；正在读取实时会话。"
             }
           }
           return
@@ -443,6 +419,9 @@ extension SystemExtensionController: OSSystemExtensionRequestDelegate {
     didFinishWithResult result: OSSystemExtensionRequest.Result
   ) {
     Task { @MainActor in
+      if request === propertiesRequest {
+        return
+      }
       installationState = .installed
       isBusy = false
       activity = result == .willCompleteAfterReboot
@@ -455,9 +434,32 @@ extension SystemExtensionController: OSSystemExtensionRequestDelegate {
     let nsError = error as NSError
     let detail = "\(nsError.localizedDescription) [\(nsError.domain) \(nsError.code)]"
     Task { @MainActor in
+      if request === propertiesRequest {
+        propertiesRequest = nil
+        installationState = .failed("状态查询失败：\(detail)")
+        return
+      }
       installationState = .failed(detail)
       isBusy = false
       activity = "System Extension 激活失败：\(detail)"
+    }
+  }
+
+  nonisolated func request(
+    _ request: OSSystemExtensionRequest,
+    foundProperties properties: [OSSystemExtensionProperties]
+  ) {
+    Task { @MainActor in
+      guard request === propertiesRequest else { return }
+      if properties.contains(where: { $0.isAwaitingUserApproval }) {
+        installationState = .awaitingApproval
+      } else if properties.contains(where: { $0.isEnabled && !$0.isUninstalling }) {
+        installationState = .installed
+      } else if properties.contains(where: { $0.isUninstalling }) {
+        installationState = .uninstalling
+      } else {
+        installationState = .notInstalled
+      }
     }
   }
 }

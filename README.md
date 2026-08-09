@@ -1,6 +1,6 @@
 # HushWire
 
-> **Status: experimental.** HushWire has not been audited. v0.6.0 replaces the earlier custom cryptographic construction with the standard `snow` Noise state machine, but the complete tunnel remains untested in adversarial conditions. Do not rely on it for sensitive traffic yet.
+> **Status: experimental.** HushWire has not been audited. v0.6.x replaces the earlier custom cryptographic construction with the standard `snow` Noise state machine, but the complete tunnel remains untested in adversarial conditions. Do not rely on it for sensitive traffic yet.
 
 HushWire is an experimental WireGuard-like L3 tunnel focused on observability and debuggability.
 

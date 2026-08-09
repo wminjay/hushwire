@@ -1,6 +1,6 @@
 # Release Notes
 
-> ⚠️ **Experimental and not audited.** v0.6.0 fixes known flaws in the earlier cryptographic construction, but HushWire is not yet suitable for sensitive production traffic.
+> ⚠️ **Experimental and not audited.** v0.6.x fixes known flaws in the earlier cryptographic construction, but HushWire is not yet suitable for sensitive production traffic.
 
 ## What is HushWire
 
@@ -16,6 +16,17 @@ HushWire is an experimental WireGuard-like IPv4 L3 tunnel focused on observabili
 | `HushWire-aarch64-macos-app.zip` | macOS Apple Silicon personal GUI client |
 
 Each archive has a matching `.sha256` checksum. The GUI app is ad-hoc signed and not notarized; it is intended for personal testing.
+
+## v0.6.1: shutdown cleanup and preview-state fixes
+
+v0.6.1 is wire-compatible with v0.6.0 and requires no key or TOML changes.
+
+- Linux route deletion now performs a short bounded retry when a supervisor using `KillMode=control-group` interrupts the transient `ip route del` child during shutdown. Cleanup still verifies that the exact route is gone and reports a real residual route after the retry limit.
+- The macOS System Extension development preview queries the installed extension properties on App launch, so reopening the GUI restores the real enabled/approval/uninstall state instead of showing “not checked.”
+- Reopening the preview App while connected now reports that it recovered the system-managed session, while the provider, tunnel, traffic and default route remain unchanged.
+- The preview's `/32`-only policy is shared with its smoke test and explicitly rejects subnet/default routes, a fixed local listen port, and configurations without peer routes before any VPN settings are installed.
+
+Verification included three consecutive systemd start/stop cycles with exact route checks and no cleanup warning; connected GUI quit/reopen and live App replacement without restarting the provider; startup while the isolated peer was unavailable followed by automatic authentication when it returned; and unchanged default routing, DNS, Tailscale, and production listeners throughout.
 
 ## v0.6.0: security protocol replacement
 
@@ -57,7 +68,7 @@ Do not merge a v0.6 peer into an old production instance until every endpoint at
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
-./hushwire --version       # hushwire 0.6.0
+./hushwire --version       # hushwire 0.6.1
 ./hushwire genkey
 openssl rand -base64 32
 sudo ./hushwire up -c my-node.toml
