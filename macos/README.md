@@ -74,6 +74,39 @@ The development build is written below
 build command does not install or activate the extension. First activation must
 be initiated from the app and approved in macOS System Settings.
 
+### Direct distribution
+
+The System Extension release uses separate Developer ID entitlements because
+Apple requires `packet-tunnel-provider-systemextension` for a Network Extension
+distributed outside the Mac App Store. The container app and extension each
+need a matching Developer ID provisioning profile, and the signing identity must
+be a `Developer ID Application` certificate with its private key in the local
+keychain.
+
+Once those assets exist, the release packager validates the two profiles,
+builds an unsigned Release product, embeds the profiles, signs the extension and
+then the app with Hardened Runtime and a secure timestamp, submits the archive
+for notarization, staples the ticket, runs Gatekeeper validation, and emits the
+final zip plus checksum below `dist/release`:
+
+```bash
+export HUSHWIRE_DEVELOPER_ID_APP_PROFILE=/private/path/HushWire.provisionprofile
+export HUSHWIRE_DEVELOPER_ID_EXTENSION_PROFILE=/private/path/HushWirePacketTunnel.provisionprofile
+export HUSHWIRE_DEVELOPER_ID_IDENTITY='Developer ID Application: Example (TEAMID)'
+export HUSHWIRE_ASC_KEY_PATH=/private/path/AuthKey.p8
+export HUSHWIRE_ASC_KEY_ID=EXAMPLE123
+export HUSHWIRE_ASC_ISSUER_ID=00000000-0000-0000-0000-000000000000
+
+macos/scripts/package-system-extension.sh --check-prerequisites
+macos/scripts/package-system-extension.sh
+```
+
+The packager deliberately has no ad-hoc or unsigned release mode. A development
+build remains available through `HUSHWIRE_SIGNING=development`, but it must not
+be uploaded as a public release. For v0.7 and later, the tag workflow creates a
+draft GitHub release containing the CLI archives; publish it only after adding
+the notarized System Extension zip and its checksum.
+
 The System Extension defaults to the `host-routes-only` policy. In that mode it
 only accepts `/32` entries from `allowed_ips`, leaves the default route and DNS
 unchanged, and requires `interface.listen` to use port `0` so macOS can manage

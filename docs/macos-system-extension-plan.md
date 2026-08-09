@@ -222,7 +222,8 @@ API 最小集合：
 - 在独立 UTM macOS 26.6.1 虚拟机中完成 build 10 / extension build 8 验收：`/32` 模式只安装 `10.77.61.1/32`，默认路由、DNS 与公网出口保持不变；全隧道模式将默认流量导入 utun、把 `154.40.60.58` endpoint 保留在 `en0`、安装 `1.1.1.1`/`1.0.0.1` DNS，并从隔离服务端出口访问公网。断开后路由、DNS 和公网出口均恢复，宿主机网络全程未变。
 - 全隧道服务端不可达时，连续观测到 15 秒预握手窗口内默认路由和 DNS 从未改变，随后自动失败并回到 Disconnected；绕过 App 直接启动的请求在约 1 秒内因缺少本次明确确认而被拒绝。
 - 完成 System Extension build 6 → 7 → 8 原位升级。测试发现快速停止再启动时 `NWParameters.allowLocalEndpointReuse` 会复用刚取消的 UDP 流，使服务端暂时保留旧会话直到 90 秒恢复计时器触发；禁用本地 endpoint 复用后，连续重连使用不同 NAT 端口并约 1 秒完成握手。停止路径也改为由 macOS 在 `stopTunnel` 完成后统一拆除 utun，避免应用重复清理 network settings 的竞态和误报。
-- 待完成：sleep/wake、Wi-Fi/有线切换、扩展崩溃与系统重启、24 小时运行、Developer ID 公证和干净环境直接分发验收。
+- Developer ID 直接分发 entitlement 与本地打包器已经落地；打包器会验证两个 direct profile，按 extension → app 顺序签名，要求 Hardened Runtime/secure timestamp，随后执行 notarize、staple、Gatekeeper 验证并生成校验和。v0.7 及以后 tag 只先产生草稿 Release，避免旧的 ad-hoc GUI 被误当成 System Extension 正式包。
+- 待完成：sleep/wake、Wi-Fi/有线切换、扩展崩溃与系统重启、24 小时运行、Developer ID 证书/profile 实签、公证和干净环境直接分发验收。
 
 验收顺序：
 

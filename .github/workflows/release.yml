@@ -85,7 +85,8 @@ jobs:
             ${{ matrix.artifact }}.tar.gz.sha256
 
   macos-app:
-    name: Build macOS personal client
+    name: Build legacy macOS personal client
+    if: startsWith(github.ref_name, 'v0.6.')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -121,6 +122,10 @@ jobs:
   release:
     name: Publish to GitHub Release
     needs: [build, macos-app]
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.macos-app.result == 'success' || needs.macos-app.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -162,5 +167,6 @@ jobs:
           files: artifacts/*
           body: ${{ steps.body.outputs.body }}
           generate_release_notes: false
+          draft: ${{ !startsWith(github.ref_name, 'v0.6.') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
