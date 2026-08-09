@@ -1,15 +1,7 @@
-// Core crypto modules live in the library crate (src/lib.rs) so integration
-// tests can access them. Other modules (config, tunnel, etc.) are private to
-// the binary and import from hushwire:: directly.
-mod config;
 mod doctor;
 mod firewall;
-mod packet;
-mod router;
+mod process;
 mod routing;
-mod state;
-mod tcp_transport;
-mod transport;
 mod tunnel;
 
 use std::net::Ipv4Addr;
@@ -17,10 +9,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use hushwire::config::Config;
+use hushwire::router::Router;
 use tracing_subscriber::EnvFilter;
-
-use crate::config::Config;
-use crate::router::Router;
 
 #[derive(Debug, Parser)]
 #[command(name = "hushwire")]
@@ -29,6 +20,11 @@ use crate::router::Router;
 struct Cli {
     #[arg(long, global = true, default_value = "text")]
     log_format: LogFormat,
+
+    /// Start in a new POSIX session so a transient privileged launcher cannot
+    /// terminate the long-running tunnel when the launcher is reclaimed.
+    #[arg(long, global = true, hide = true)]
+    detach_session: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -80,6 +76,16 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_format);
+
+    if cli.detach_session {
+        let detached = process::detach_session().context("detaching from launcher session")?;
+        tracing::info!(
+            pid = detached.pid,
+            previous_process_group = detached.previous_process_group,
+            session_id = detached.session_id,
+            "detached process from launcher session"
+        );
+    }
 
     match cli.command {
         Command::Check { config } => {

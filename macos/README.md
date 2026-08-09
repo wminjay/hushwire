@@ -34,7 +34,50 @@ open dist/HushWire.app
 
 The result is `dist/HushWire.app`. It receives an ad-hoc local signature, which is sufficient for an app built and used on the same Mac. A Developer ID certificate and notarization would be needed before distributing it to other people.
 
-The v0.5.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
+To assemble a second test build without replacing an app that is already
+running, choose a staging directory below `dist`:
+
+```bash
+HUSHWIRE_OUTPUT_DIRECTORY="$PWD/dist/staging" macos/scripts/build-app.sh
+```
+
+## Embedded Rust core
+
+The Network Extension migration uses a stable C ABI instead of exposing Rust
+types directly to Swift. Build the arm64/x86_64 universal XCFramework and run
+the real Swift linkage smoke test with:
+
+```bash
+macos/scripts/build-core-xcframework.sh
+macos/scripts/test-core-xcframework.sh
+```
+
+The generated product is `dist/HushWireCore.xcframework`. The committed ABI
+surface is in `Core/include/HushWireCore.h`; callback buffers are borrowed only
+until the callback returns, and `stop` waits for in-flight callbacks before it
+erases session state. The framework contains protocol logic only: macOS still
+owns packet flow, routes, DNS, and the UDP/TCP transport lifecycle.
+
+## Packet Tunnel System Extension preview
+
+The Xcode project is generated from `project.yml`; generated project state is
+ignored so signing and target changes stay reviewable. Build the lifecycle-only
+skeleton without signing or with the configured development team using:
+
+```bash
+macos/scripts/build-system-extension.sh
+HUSHWIRE_SIGNING=development macos/scripts/build-system-extension.sh
+```
+
+The development build is written below
+`dist/DerivedData/HushWireSystemSigned/Build/Products/Debug/HushWire.app`. The
+build command does not install or activate the extension. First activation must
+be initiated from the app and approved in macOS System Settings. This preview
+intentionally rejects tunnel startup before calling
+`setTunnelNetworkSettings`, so its lifecycle test cannot add routes or change
+DNS.
+
+The v0.6.0 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
 
 ## Prepare a client configuration
 
@@ -85,6 +128,18 @@ chmod 600 my-client.toml
 - executable identity: `/var/run/hushwire-<uid>.binary`
 
 Quitting the GUI does not disconnect an active tunnel. This lets the tunnel continue in the background; reopening the app finds it through the process state file. Use **断开** before deleting or replacing the app.
+
+The privileged launcher starts the tunnel in a new POSIX session. This keeps
+the long-running daemon outside AppleScript's temporary `authtrampoline`
+process group, so macOS reclaiming the authorization helper does not terminate
+the tunnel. The PID and executable checks remain in place for explicit stops.
+
+The planned migration from this transitional launcher to a directly
+distributed Packet Tunnel System Extension is documented in
+[`../docs/macos-system-extension-plan.md`](../docs/macos-system-extension-plan.md).
+The Rust CLI now drives the same platform-independent `Engine` intended for
+the extension; TUN, route, firewall, and process management remain isolated in
+the CLI adapter while the System Extension target is being built.
 
 ## Current limitations
 

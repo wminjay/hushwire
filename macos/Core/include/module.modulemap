@@ -1,0 +1,4 @@
+module HushWireCore {
+  header "HushWireCore.h"
+  export *
+}

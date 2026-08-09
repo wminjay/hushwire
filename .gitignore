@@ -2,6 +2,7 @@
 /target
 /dist
 /macos/.build
+/macos/HushWireSystem.xcodeproj
 **/*.rs.bk
 
 # macOS

@@ -20,11 +20,110 @@ use anyhow::Context;
 
 use crate::transport::{PacketTransport, ReceivedPacket};
 
+const MAX_PENDING_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bytes already framed for TCP but not yet accepted by the kernel.
+///
+/// A non-blocking `write` may consume only part of a frame before returning
+/// `WouldBlock`. Keeping the remainder here is essential: dropping it would
+/// desynchronise the peer's length-prefixed byte stream permanently.
+struct PendingWrites {
+    bytes: Vec<u8>,
+    offset: usize,
+    limit: usize,
+}
+
+impl PendingWrites {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            offset: 0,
+            limit,
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn enqueue_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        if frame.len() > usize::from(u16::MAX) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "TCP frame exceeds 65535 bytes",
+            ));
+        }
+
+        let encoded_len = 2 + frame.len();
+        if self.pending_len().saturating_add(encoded_len) > self.limit {
+            return Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "TCP pending-write queue is full",
+            ));
+        }
+
+        self.compact();
+        self.bytes
+            .extend_from_slice(&(frame.len() as u16).to_be_bytes());
+        self.bytes.extend_from_slice(frame);
+        Ok(())
+    }
+
+    /// Flush as much queued data as the non-blocking stream currently accepts.
+    /// `WouldBlock` is not an error: the exact unwritten suffix stays queued.
+    fn flush_to(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        while self.offset < self.bytes.len() {
+            match writer.write(&self.bytes[self.offset..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        ErrorKind::WriteZero,
+                        "TCP stream accepted zero bytes",
+                    ));
+                }
+                Ok(written) => self.offset += written,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.bytes.clear();
+        self.offset = 0;
+        Ok(())
+    }
+
+    fn compact(&mut self) {
+        if self.offset == 0 {
+            return;
+        }
+        let pending = self.pending_len();
+        if pending == 0 {
+            self.bytes.clear();
+        } else {
+            self.bytes.copy_within(self.offset.., 0);
+            self.bytes.truncate(pending);
+        }
+        self.offset = 0;
+    }
+}
+
+impl Default for PendingWrites {
+    fn default() -> Self {
+        Self::new(MAX_PENDING_WRITE_BYTES)
+    }
+}
+
 /// Per-connection read state: accumulates bytes until a full frame is available.
 struct ConnState {
     stream: TcpStream,
     /// Bytes read from the stream but not yet assembled into a full frame.
     read_buf: Vec<u8>,
+    /// Complete framed writes waiting for kernel send-buffer capacity.
+    pending_writes: PendingWrites,
 }
 
 impl ConnState {
@@ -43,6 +142,7 @@ impl ConnState {
         Self {
             stream,
             read_buf: Vec::new(),
+            pending_writes: PendingWrites::default(),
         }
     }
 
@@ -51,6 +151,10 @@ impl ConnState {
     /// - Ok(None) — not enough data yet, try again later
     /// - Err(_) — connection is broken
     fn try_read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        // The receive loop runs continuously, so it also provides forward
+        // progress for writes that previously stopped at `WouldBlock`.
+        self.pending_writes.flush_to(&mut self.stream)?;
+
         // Read available bytes into the buffer.
         let mut tmp = [0u8; 65_535];
         loop {
@@ -94,12 +198,14 @@ impl ConnState {
         Ok(Some(frame))
     }
 
-    fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
-        let len = frame.len() as u16;
-        let mut buf = Vec::with_capacity(2 + frame.len());
-        buf.extend_from_slice(&len.to_be_bytes());
-        buf.extend_from_slice(frame);
-        self.stream.write_all(&buf)
+    fn queue_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        // First reclaim any capacity that became writable since the previous
+        // call, then enqueue the new frame atomically, then make another flush
+        // attempt. A full queue rejects the whole new frame before mutating the
+        // stream, preserving framing even under sustained backpressure.
+        self.pending_writes.flush_to(&mut self.stream)?;
+        self.pending_writes.enqueue_frame(frame)?;
+        self.pending_writes.flush_to(&mut self.stream)
     }
 }
 
@@ -196,7 +302,7 @@ impl PacketTransport for TcpTransport {
         let mut c = conn
             .lock()
             .map_err(|_| io::Error::other("connection mutex poisoned"))?;
-        c.write_frame(frame)?;
+        c.queue_frame(frame)?;
         Ok(frame.len())
     }
 
@@ -271,7 +377,7 @@ mod tests {
         // Write a frame with length prefix.
         let payload = b"hello tcp";
         let mut state = ConnState::new(writer_stream);
-        state.write_frame(payload).unwrap();
+        state.queue_frame(payload).unwrap();
 
         // Read it on the other side. Non-blocking, so may need to retry
         // until the data arrives in the kernel buffer.
@@ -295,8 +401,8 @@ mod tests {
         let (client_stream, _) = listener.accept().unwrap();
 
         let mut state = ConnState::new(client_stream);
-        state.write_frame(b"first").unwrap();
-        state.write_frame(b"second").unwrap();
+        state.queue_frame(b"first").unwrap();
+        state.queue_frame(b"second").unwrap();
 
         let mut state2 = ConnState::new(server_stream);
         // Wait for both frames to arrive.
@@ -305,6 +411,59 @@ mod tests {
         let f2 = state2.try_read_frame().unwrap();
         assert_eq!(f1, Some(b"first".to_vec()));
         assert_eq!(f2, Some(b"second".to_vec()));
+    }
+
+    #[derive(Default)]
+    struct PartialNonblockingWriter {
+        bytes: Vec<u8>,
+        block_next: bool,
+    }
+
+    impl Write for PartialNonblockingWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            if self.block_next {
+                self.block_next = false;
+                return Err(io::Error::from(ErrorKind::WouldBlock));
+            }
+            let written = input.len().min(3);
+            self.bytes.extend_from_slice(&input[..written]);
+            self.block_next = true;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn partial_nonblocking_writes_preserve_frame_boundaries() {
+        let mut pending = PendingWrites::new(1024);
+        pending.enqueue_frame(b"first").unwrap();
+        pending.enqueue_frame(b"second").unwrap();
+
+        let mut writer = PartialNonblockingWriter::default();
+        while pending.pending_len() != 0 {
+            pending.flush_to(&mut writer).unwrap();
+        }
+
+        let expected = [
+            0, 5, b'f', b'i', b'r', b's', b't', 0, 6, b's', b'e', b'c', b'o', b'n', b'd',
+        ];
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn full_pending_queue_rejects_whole_frame_without_mutation() {
+        let mut pending = PendingWrites::new(8);
+        pending.enqueue_frame(b"abc").unwrap();
+        let before = pending.bytes.clone();
+
+        let error = pending.enqueue_frame(b"defg").unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        assert_eq!(pending.bytes, before);
+        assert_eq!(pending.pending_len(), 5);
     }
 
     /// End-to-end test: two TcpTransport instances on loopback, one sends,

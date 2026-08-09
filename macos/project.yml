@@ -1,0 +1,88 @@
+name: HushWireSystem
+
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  groupSortPosition: top
+  generateEmptyDirectories: true
+  xcodeVersion: "26.0"
+
+configs:
+  Debug: debug
+  Release: release
+
+settings:
+  base:
+    CLANG_ENABLE_MODULES: YES
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 4
+    DEVELOPMENT_TEAM: 95Q852BXKJ
+    ENABLE_HARDENED_RUNTIME: YES
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    MARKETING_VERSION: 0.7.0
+    SWIFT_STRICT_CONCURRENCY: minimal
+    SWIFT_VERSION: "5.0"
+
+targets:
+  HushWireSystemApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: SystemExtension/App
+        excludes:
+          - Info.plist
+          - HushWire.entitlements
+      - path: SystemExtension/Shared
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: SystemExtension/App/HushWire.entitlements
+        CURRENT_PROJECT_VERSION: 6
+        INFOPLIST_FILE: SystemExtension/App/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.jamie.HushWire
+        PRODUCT_NAME: HushWire
+    dependencies:
+      - target: HushWirePacketTunnel
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/SystemExtensions
+      - framework: ../dist/HushWireCore.xcframework
+        embed: false
+
+  HushWirePacketTunnel:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: SystemExtension/PacketTunnel
+        excludes:
+          - Info.plist
+          - HushWirePacketTunnel.entitlements
+      - path: SystemExtension/Shared
+    settings:
+      base:
+        APPLICATION_EXTENSION_API_ONLY: YES
+        CODE_SIGN_ENTITLEMENTS: SystemExtension/PacketTunnel/HushWirePacketTunnel.entitlements
+        CURRENT_PROJECT_VERSION: 5
+        ENABLE_APP_SANDBOX: YES
+        INFOPLIST_FILE: SystemExtension/PacketTunnel/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.jamie.HushWire.PacketTunnel
+        PRODUCT_MODULE_NAME: HushWirePacketTunnel
+        PRODUCT_NAME: HushWirePacketTunnel
+        SKIP_INSTALL: YES
+        WRAPPER_NAME: "$(PRODUCT_BUNDLE_IDENTIFIER).systemextension"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - framework: ../dist/HushWireCore.xcframework
+        embed: false
+
+schemes:
+  HushWireSystem:
+    build:
+      targets:
+        HushWireSystemApp: all
+        HushWirePacketTunnel: all
+    run:
+      config: Debug
+    archive:
+      config: Release

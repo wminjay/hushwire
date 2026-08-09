@@ -2,9 +2,8 @@ use std::net::IpAddr;
 use std::process::Command;
 
 use anyhow::Context;
+use hushwire::router::Router;
 use tracing::{info, warn};
-
-use crate::router::Router;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteKind {
@@ -133,14 +132,15 @@ fn add_route_to_dev(prefix: &str, dev: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn del_tun_route(prefix: &str, dev: &str) -> anyhow::Result<()> {
-    let status = Command::new("ip")
+    let output = Command::new("ip")
         .args(["route", "del", prefix, "dev", dev])
-        .status()
+        .output()
         .context("running ip route del")?;
-    if !status.success() {
-        anyhow::bail!("ip route del failed");
+    if output.status.success() || !linux_route_exists(prefix, Some(dev))? {
+        return Ok(());
     }
-    Ok(())
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("ip route del failed: {}", stderr.trim());
 }
 
 #[cfg(target_os = "linux")]
@@ -169,14 +169,50 @@ fn add_host_route_dev(host: &str, dev: &str) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn del_host_route(host: &str) -> anyhow::Result<()> {
-    let status = Command::new("ip")
+    let output = Command::new("ip")
         .args(["route", "del", host])
-        .status()
+        .output()
         .context("running ip route del host")?;
-    if !status.success() {
-        anyhow::bail!("ip route del host failed");
+    if output.status.success() || !linux_route_exists(host, None)? {
+        return Ok(());
     }
-    Ok(())
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("ip route del host failed: {}", stderr.trim());
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_exists(prefix: &str, dev: Option<&str>) -> anyhow::Result<bool> {
+    // Query without a device filter. If the TUN has already disappeared,
+    // `ip route show ... dev <tun>` itself can fail even though cleanup has
+    // reached the desired state.
+    let output = Command::new("ip")
+        .args(["route", "show", prefix])
+        .output()
+        .context("running ip route show after delete")?;
+    if !output.status.success() {
+        anyhow::bail!("ip route show failed after delete");
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(route_listing_contains(&listing, dev))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn route_listing_contains(listing: &str, dev: Option<&str>) -> bool {
+    listing.lines().any(|line| match dev {
+        None => !line.trim().is_empty(),
+        Some(expected) => route_line_uses_dev(line, expected),
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn route_line_uses_dev(line: &str, expected: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "dev" {
+            return tokens.next() == Some(expected);
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -288,4 +324,18 @@ fn get_route_info(dst: &str) -> anyhow::Result<(Option<String>, String)> {
 
     let interface = interface.context("could not find interface in route output")?;
     Ok((gateway, interface))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_listing_contains;
+
+    #[test]
+    fn route_listing_distinguishes_target_device() {
+        let listing = "10.77.60.2 dev hwmactw0 scope link\n";
+        assert!(route_listing_contains(listing, Some("hwmactw0")));
+        assert!(!route_listing_contains(listing, Some("stb0")));
+        assert!(route_listing_contains(listing, None));
+        assert!(!route_listing_contains("", None));
+    }
 }

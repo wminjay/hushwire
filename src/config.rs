@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -75,6 +75,14 @@ pub enum ConfigError {
     EmptyPeerName,
     #[error("duplicate peer name: {0}")]
     DuplicatePeerName(String),
+    #[error(
+        "peers {first} and {second} use the same psk; every peer must have unique credentials"
+    )]
+    DuplicatePeerPsk { first: String, second: String },
+    #[error(
+        "peers {first} and {second} use the same public_key; every peer must have a unique static identity"
+    )]
+    DuplicatePeerPublicKey { first: String, second: String },
     #[error("peer {0} has no allowed_ips")]
     PeerWithoutAllowedIps(String),
     #[error("mtu must be at least 576, got {0}")]
@@ -129,7 +137,16 @@ impl PeerConfig {
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&text)?;
+        Self::parse(&text)
+    }
+
+    /// Parse and validate a TOML configuration already held in memory.
+    ///
+    /// Platform integrations such as a Network Extension receive their
+    /// configuration from the host application rather than a filesystem
+    /// path, so they must not need to create a temporary plaintext file.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
@@ -148,6 +165,8 @@ impl Config {
         }
 
         let mut names = HashSet::new();
+        let mut psks = HashMap::new();
+        let mut public_keys = HashMap::new();
         for peer in &self.peer {
             if peer.name.trim().is_empty() {
                 return Err(ConfigError::EmptyPeerName);
@@ -158,11 +177,21 @@ impl Config {
             if peer.allowed_ips.is_empty() {
                 return Err(ConfigError::PeerWithoutAllowedIps(peer.name.clone()));
             }
-            if decode_psk(&peer.psk).is_none() {
-                return Err(ConfigError::InvalidPsk(peer.name.clone()));
+            let psk =
+                decode_psk(&peer.psk).ok_or_else(|| ConfigError::InvalidPsk(peer.name.clone()))?;
+            if let Some(first) = psks.insert(psk, peer.name.clone()) {
+                return Err(ConfigError::DuplicatePeerPsk {
+                    first,
+                    second: peer.name.clone(),
+                });
             }
-            if decode_key(&peer.public_key).is_none() {
-                return Err(ConfigError::InvalidPublicKey(peer.name.clone()));
+            let public_key = decode_key(&peer.public_key)
+                .ok_or_else(|| ConfigError::InvalidPublicKey(peer.name.clone()))?;
+            if let Some(first) = public_keys.insert(public_key, peer.name.clone()) {
+                return Err(ConfigError::DuplicatePeerPublicKey {
+                    first,
+                    second: peer.name.clone(),
+                });
             }
             if peer.udp_rebind_after > 0 {
                 if self.interface.transport != TransportConfig::Udp {
@@ -253,6 +282,11 @@ mod tests {
         }
     }
 
+    fn encoded_key(byte: u8) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        STANDARD.encode([byte; 32])
+    }
+
     #[test]
     fn accepts_minimal_valid_config() {
         let config = Config {
@@ -327,6 +361,38 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::DuplicatePeerName(n)) if n == "dup"
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_peer_psks() {
+        let first = peer("first");
+        let mut second = peer("second");
+        second.public_key = encoded_key(0x43);
+        let config = Config {
+            interface: interface(),
+            peer: vec![first, second],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::DuplicatePeerPsk { first, second })
+                if first == "first" && second == "second"
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_peer_public_keys() {
+        let first = peer("first");
+        let mut second = peer("second");
+        second.psk = encoded_key(0x43);
+        let config = Config {
+            interface: interface(),
+            peer: vec![first, second],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::DuplicatePeerPublicKey { first, second })
+                if first == "first" && second == "second"
         ));
     }
 

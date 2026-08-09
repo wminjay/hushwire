@@ -1,14 +1,12 @@
 # Release Notes
 
-> ⚠️ **Experimental.** Not audited. Noise handshake provides forward secrecy, but implementation is new.
+> ⚠️ **Experimental and not audited.** v0.6.0 fixes known flaws in the earlier cryptographic construction, but HushWire is not yet suitable for sensitive production traffic.
 
 ## What is HushWire
 
-A WireGuard-like L3 tunnel focused on observability and debuggability. Noise_IKpsk2 handshake with forward secrecy, ChaCha20-Poly1305 encrypted, anti-replay protected, with pluggable transport and exit-node support.
+HushWire is an experimental WireGuard-like IPv4 L3 tunnel focused on observability and debuggability, with UDP/TCP transports, exit-node support, and a personal macOS GUI.
 
 ## Download
-
-Prebuilt binaries are attached to each release (statically linked musl on Linux — runs on any glibc version):
 
 | File | Platform |
 |---|---|
@@ -17,69 +15,92 @@ Prebuilt binaries are attached to each release (statically linked musl on Linux 
 | `hushwire-aarch64-macos.tar.gz` | macOS Apple Silicon |
 | `HushWire-aarch64-macos-app.zip` | macOS Apple Silicon personal GUI client |
 
-Each archive has a matching `.sha256` checksum.
+Each archive has a matching `.sha256` checksum. The GUI app is ad-hoc signed and not notarized; it is intended for personal testing.
 
-The GUI app is ad-hoc signed and not notarized. It is intended for personal testing; macOS may require opening it from Finder's context menu the first time.
+## v0.6.0: security protocol replacement
+
+This release replaces wire protocol v2 and its custom cryptographic construction with protocol v3 using `snow`'s standard `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` state machine.
+
+The replacement addresses the known v2 issues:
+
+- the per-packet nonce had only 32 random bits under one session key, reaching roughly 50% collision probability around 77,000 packets;
+- handshake encryption reused a fixed ChaCha20-Poly1305 nonce;
+- configured initiator static public keys were not compared after decryption, so inbound peer selection effectively depended on the PSK;
+- packet counters and the advertised rekey limit were not actually enforced;
+- replay memory covered only the latest FIFO entries, allowing sufficiently old ciphertexts to leave the remembered set.
+
+Protocol v3 now provides:
+
+- a monotonic `u64` transport counter used as Noise's stateless AEAD nonce;
+- a 4096-counter sliding replay window that advances only after authentication;
+- strict configured static-key verification on the responder and responder-key pinning on the initiator;
+- rejection of duplicate peer PSKs and duplicate peer static public keys;
+- soft rekey after 120 seconds or 2^32 messages, with a 180-second reject deadline;
+- responder candidate sessions that are promoted only after the first authenticated transport packet, preventing a replayed msg1 from immediately replacing a working session;
+- receive-only retention of the previous authenticated session through its reject deadline, so in-flight packets are not discarded while peers switch keys;
+- suppression of a competing local rekey while a valid responder candidate is pending, avoiding back-to-back replacement sessions;
+- deterministic simultaneous-handshake resolution and bounded retry lifetimes.
+
+## Reliability fixes
+
+- TCP transport now preserves partially written length-prefixed frames across `EAGAIN`/`WouldBlock` with a bounded pending-write queue. A short socket write can no longer desynchronize the encrypted stream.
+- Linux route cleanup now verifies whether a route is already absent when deletion races with interface teardown, while still reporting a real route that remains installed.
+- The personal macOS client's privileged launcher starts HushWire in an independent session, so authorization-helper cleanup no longer terminates a healthy tunnel.
+
+## Breaking compatibility and migration
+
+v0.6.0 cannot communicate with v0.5.1 or earlier. Upgrade and restart both ends of each link together. The single-peer TOML format is unchanged. For a multi-peer interface, assign every `[[peer]]` a distinct PSK and distinct static `public_key`; duplicate credentials now fail validation.
+
+Do not merge a v0.6 peer into an old production instance until every endpoint attached to that instance is ready to move at the same time.
 
 ## Quick start
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
-./hushwire --version       # prints: hushwire 0.5.1
-./hushwire genkey          # generate a static key pair (PrivateKey + PublicKey)
-openssl rand -base64 32    # generate a PSK, use same value on both peers
+./hushwire --version       # hushwire 0.6.0
+./hushwire genkey
+openssl rand -base64 32
 sudo ./hushwire up -c my-node.toml
 ```
 
-See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for configuration details.
+See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for configuration and routing details.
 
-## What's new in v0.5.1
+## Existing tunnel capabilities
 
-- **TCP one-sided restart recovery** — a re-established TCP stream no longer remains stuck on the Noise session lost by the restarted peer. Authenticated liveness timeout now invalidates the stale session and immediately starts a fresh handshake while preserving the client process.
-- **Transport-independent session timeout** — `session_timeout` can explicitly tune stale-session recovery. TCP peers with persistent keepalive automatically default to three keepalive intervals with a 15-second minimum; `0` explicitly disables it.
-- **UDP behavior preserved** — `udp_rebind_after` still takes precedence for UDP because it repairs both the cryptographic session and the NAT path.
-- **Real UDP and TCP recovery tests** — CI runs the one-sided restart scenario for both transports inside isolated Linux network namespaces and verifies that the original client PID survives.
+- UDP transport and TCP fallback with length-prefix framing
+- one-sided peer-restart recovery with authenticated keepalive probes
+- endpoint roaming and optional UDP source-port rebinding
+- IPv4 longest-prefix routing and full-tunnel split routes
+- Linux exit-node forwarding/NAT via `--exit-node`
+- route/firewall/TUN cleanup on shutdown
+- CLI diagnostics and structured logs
+- reusable platform-independent packet engine with IP/transport actions,
+  handshake events, and peer-stat snapshots
+- versioned C ABI and arm64/x86_64 macOS XCFramework for the staged Packet
+  Tunnel System Extension migration
+- personal SwiftUI macOS client whose tunnel process detaches from the
+  temporary macOS authorization launcher's process group
 
-TCP recovery is automatic when keepalive is enabled, or can be tuned explicitly:
+## Verification in this release
 
-```toml
-[[peer]]
-persistent_keepalive = 5
-session_timeout = 20
-```
-
-The wire format remains compatible with v0.4.1 and v0.5.0. The surviving TCP peer needs v0.5.1 to perform automatic stale-session replacement.
-
-## What works (v0.5.1)
-
-- **Noise_IKpsk2 handshake** — ephemeral key exchange with forward secrecy (PFS)
-- **ChaCha20-Poly1305 AEAD** data encryption with session keys (not PSK)
-- **Anti-replay protection** — bounded FIFO nonce window per session (4096 entries)
-- **Endpoint roaming** — peers behind NAT connect by sending keepalives; the server learns their real address and replies there (same technique as WireGuard)
-- **IPv4 routing** by longest-prefix match
-- **UDP transport** (default, low-latency)
-- **TCP transport** (fallback for UDP-blocked networks, 2-byte length-prefix framing, TCP_NODELAY)
-- **Automatic route management** — host routes, full-tunnel split routing, endpoint exception, all torn down on shutdown
-- **Exit-node NAT** — `--exit-node` installs iptables MASQUERADE + ip_forward, restored on shutdown
-- **Persistent keepalive** and **structured peer stats** logging
-- **CLI**: `check`, `route`, `explain`, `plan-routes`, `doctor`, `up`, `genkey`, `--help`, `--version`
-- **Personal macOS GUI**: config selection/checking, key generation, privileged connect/disconnect, process restoration, and live logs
-
-## Tested in practice
-
-- Dual-node tunnel on real Linux hosts (cross-region US ↔ CN, ~185ms RTT, 0% loss)
-- Exit-node NAT verified — client traffic egresses via the exit node (`ifconfig.me` confirms)
-- **NAT traversal** — a VM behind NAT establishes a bidirectional tunnel to a public-IP server (~280ms RTT, 0% loss)
-- **Full-tunnel via exit node** — NAT'd client sends all traffic through the server
-- Clean shutdown verified — routes, firewall rules, and TUN device removed on SIGTERM
-- **One-sided restart recovery over UDP and TCP** — verified in isolated Linux network namespaces while preserving the client process
-- **Real macOS GUI tunnels** — UDP and TCP connectivity, one-sided server restart recovery with the original Mac client PID preserved, and graceful disconnect cleanup verified against an isolated public test server
-- **macOS exit routing** — targeted and full IPv4 exit profiles verified through an isolated Linux exit node, including endpoint-loop prevention, NAT egress, HTTPS, and complete route cleanup on disconnect
+- in-memory Noise handshake, identity, PSK, tamper, replay, and multi-client isolation tests;
+- an 80,000-packet regression proving monotonic non-repeating counters past the old collision-risk range;
+- candidate-session, lost-response, simultaneous-initiation, and one-sided-restart state-machine tests;
+- two in-memory packet engines completing a handshake and exchanging IPv4
+  packets in both directions without TUN devices or sockets;
+- a C ABI end-to-end handshake/data/lifecycle test and a Swift program that
+  links the universal XCFramework and exercises create/start/stop/destroy;
+- isolated Linux network-namespace recovery tests for both UDP and TCP in CI;
+- exact-hash 64 MiB transfers over both UDP and TCP, including sustained TCP backpressure;
+- an isolated macOS `/32` Packet Tunnel run across the 120-second automatic rekey boundary, with uninterrupted packets at the key transition, one responder handshake, and no decrypt/authentication errors;
+- macOS CLI/GUI builds, Swift tests, detached-session regression coverage,
+  signature checks, and privileged start/stop smoke tests in CI.
 
 ## Known limitations
 
-- **Exit-node NAT is Linux-only** — macOS is supported as a peer/client.
-- **IPv4 routing only; DNS is unmanaged** — full-tunnel profiles do not carry IPv6 or replace existing local/VPN DNS resolvers, so those paths require separate policy when bypass must be prevented.
-- **The macOS GUI is ad-hoc signed and not notarized** — it is a personal client, not an App Store build, and currently requests administrator authorization for both connect and disconnect.
-- **Probe acknowledgements require v0.4.1 or newer on both peers**; the surviving peer needs v0.5.0 for UDP stale-session replacement and v0.5.1 for TCP recovery.
-- **Not audited** — experimental project.
+- HushWire is experimental and has not received an independent security audit.
+- Wire protocol v3 has no compatibility mode for v2.
+- IPv4 only; DNS configuration is not managed.
+- exit-node NAT is Linux-only.
+- UDP and TCP are selected per process; one process does not listen on both transports simultaneously.
+- the macOS app is a personal, ad-hoc-signed client rather than a Network Extension/App Store VPN.

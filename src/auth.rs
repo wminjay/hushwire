@@ -1,287 +1,230 @@
-use chacha20poly1305::aead::{Aead, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
-use rand::rngs::OsRng;
-use rand::RngCore;
+//! HushWire v3 packet framing.
+//!
+//! Cryptography is provided by the standard Noise implementation in
+//! `crate::noise`. This module only encodes and parses the small public header
+//! needed to route handshake and transport packets.
 
-/// HushWire encrypted packet layout.
-///
-/// ```text
-///  offset  size  field
-///  0       1     version   (0x02)
-///  1       1     msg_type  (0x00=data, 0x01=keepalive, 0x02=handshake_init, 0x03=handshake_response)
-///  2..10   8     session_id (data/keepalive: identifies the session; handshake: random)
-///  10..14  4     nonce_rand (random, completes the 12-byte AEAD nonce)
-///  14..    N     ciphertext + 16-byte tag (ChaCha20-Poly1305)
-/// ```
-///
-/// AAD = version || msg_type
-///
-/// The 12-byte AEAD nonce = session_id(8) || nonce_rand(4). For data packets,
-/// session_id lets the receiver look up which session key to use. For handshake
-/// messages, session_id is random (no session yet) and the PSK is the key.
-/// Keepalive plaintext is empty for legacy one-way keepalives, `0x01` for an
-/// active liveness probe, or `0x02` for its acknowledgement.
-pub const HEADER_SIZE: usize = 14;
-pub const TAG_SIZE: usize = 16;
-/// Legacy: size of a pre-shared key. Now an alias for KEY_SIZE; kept for
-/// documentation and potential external use.
-#[allow(dead_code)]
-pub const PSK_SIZE: usize = 32;
-/// Size of a ChaCha20-Poly1305 symmetric key (used for session keys and PSK).
-pub const KEY_SIZE: usize = 32;
+pub const WIRE_VERSION: u8 = 0x03;
 pub const SESSION_ID_SIZE: usize = 8;
-pub const NONCE_RAND_SIZE: usize = 4;
-pub const MIN_PACKET_SIZE: usize = HEADER_SIZE + TAG_SIZE; // empty ciphertext + tag
+pub const COUNTER_SIZE: usize = 8;
 
-/// Byte offset of the session_id within a HushWire packet (after version + msg_type).
-pub const SESSION_ID_OFFSET: usize = 2;
-/// Byte offset of the random nonce suffix (after session_id).
-pub const NONCE_RAND_OFFSET: usize = SESSION_ID_OFFSET + SESSION_ID_SIZE;
-/// Length of the AEAD nonce in bytes (session_id + nonce_rand = 8 + 4).
-pub const NONCE_SIZE: usize = SESSION_ID_SIZE + NONCE_RAND_SIZE;
+/// `version || kind || id`.
+pub const HANDSHAKE_HEADER_SIZE: usize = 1 + 1 + SESSION_ID_SIZE;
+/// `version || kind || session_id || counter`.
+pub const TRANSPORT_HEADER_SIZE: usize = HANDSHAKE_HEADER_SIZE + COUNTER_SIZE;
+/// Every Noise transport ciphertext contains a 16-byte AEAD tag and our
+/// encrypted one-byte message type.
+pub const MIN_TRANSPORT_PACKET_SIZE: usize = TRANSPORT_HEADER_SIZE + 1 + 16;
 
-/// Authenticated keepalive payloads used for bidirectional UDP liveness.
-/// Empty payloads remain valid legacy keepalives and do not request a reply.
 pub const KEEPALIVE_PROBE_PAYLOAD: &[u8] = &[0x01];
 pub const KEEPALIVE_ACK_PAYLOAD: &[u8] = &[0x02];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MsgType {
-    Data = 0x00,
-    Keepalive = 0x01,
-    HandshakeInit = 0x02,
-    HandshakeResponse = 0x03,
+const HANDSHAKE_PROLOGUE_PREFIX: &[u8] = b"HushWire-v3-handshake";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PacketKind {
+    Transport = 0x00,
+    HandshakeInit = 0x01,
+    HandshakeResponse = 0x02,
 }
 
-impl MsgType {
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0x00 => Some(MsgType::Data),
-            0x01 => Some(MsgType::Keepalive),
-            0x02 => Some(MsgType::HandshakeInit),
-            0x03 => Some(MsgType::HandshakeResponse),
+impl PacketKind {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::Transport),
+            0x01 => Some(Self::HandshakeInit),
+            0x02 => Some(Self::HandshakeResponse),
             _ => None,
         }
     }
 
-    /// Returns true if this message type is a handshake message.
-    pub fn is_handshake(&self) -> bool {
-        matches!(self, MsgType::HandshakeInit | MsgType::HandshakeResponse)
+    pub fn is_handshake(self) -> bool {
+        matches!(self, Self::HandshakeInit | Self::HandshakeResponse)
     }
 }
 
-/// Build a 12-byte nonce from a session_id (8 bytes) + random (4 bytes).
-pub fn build_nonce(session_id: &[u8; SESSION_ID_SIZE]) -> [u8; NONCE_SIZE] {
-    let mut nonce = [0u8; NONCE_SIZE];
-    nonce[..SESSION_ID_SIZE].copy_from_slice(session_id);
-    OsRng.fill_bytes(&mut nonce[SESSION_ID_SIZE..]);
-    nonce
+/// The semantic type is encrypted inside every Noise transport message so it
+/// cannot be changed independently of the authenticated payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum MsgType {
+    Data = 0x00,
+    Keepalive = 0x01,
 }
 
-/// Extract the session_id from a packet's nonce field (bytes 2..10).
-pub fn extract_session_id(packet: &[u8]) -> Option<[u8; SESSION_ID_SIZE]> {
-    if packet.len() < HEADER_SIZE {
-        return None;
+impl MsgType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0x00 => Some(Self::Data),
+            0x01 => Some(Self::Keepalive),
+            _ => None,
+        }
     }
-    let mut sid = [0u8; SESSION_ID_SIZE];
-    sid.copy_from_slice(&packet[SESSION_ID_OFFSET..NONCE_RAND_OFFSET]);
-    Some(sid)
 }
 
-/// Encrypt `payload` with the given key (session key for data, PSK for handshake)
-/// and prepend the HushWire header.
-///
-/// `session_id` is embedded in the nonce so the receiver can look up the key.
-pub fn encode_packet(
-    payload: &[u8],
-    key: &[u8; KEY_SIZE],
-    msg_type: MsgType,
-    session_id: &[u8; SESSION_ID_SIZE],
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParsedPacket<'a> {
+    Handshake {
+        kind: PacketKind,
+        handshake_id: [u8; SESSION_ID_SIZE],
+        message: &'a [u8],
+    },
+    Transport {
+        session_id: [u8; SESSION_ID_SIZE],
+        counter: u64,
+        ciphertext: &'a [u8],
+    },
+}
+
+pub fn encode_handshake(
+    kind: PacketKind,
+    handshake_id: &[u8; SESSION_ID_SIZE],
+    message: &[u8],
 ) -> Vec<u8> {
-    let nonce = build_nonce(session_id);
-
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let aad = [0x02, msg_type as u8];
-
-    let ciphertext = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: payload,
-                aad: &aad,
-            },
-        )
-        .expect("encryption should not fail");
-
-    let mut packet = Vec::with_capacity(HEADER_SIZE + ciphertext.len());
-    packet.push(0x02); // version
-    packet.push(msg_type as u8);
-    packet.extend_from_slice(&nonce); // session_id(8) + nonce_rand(4)
-    packet.extend_from_slice(&ciphertext);
+    debug_assert!(kind.is_handshake());
+    let mut packet = Vec::with_capacity(HANDSHAKE_HEADER_SIZE + message.len());
+    packet.push(WIRE_VERSION);
+    packet.push(kind as u8);
+    packet.extend_from_slice(handshake_id);
+    packet.extend_from_slice(message);
     packet
 }
 
-/// Decrypt and authenticate `packet` using `key`.
-/// Returns the message type and plaintext payload on success.
-pub fn decode_packet(packet: &[u8], key: &[u8; KEY_SIZE]) -> Option<(MsgType, Vec<u8>)> {
-    if packet.len() < MIN_PACKET_SIZE {
+pub fn encode_transport(
+    session_id: &[u8; SESSION_ID_SIZE],
+    counter: u64,
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(TRANSPORT_HEADER_SIZE + ciphertext.len());
+    packet.push(WIRE_VERSION);
+    packet.push(PacketKind::Transport as u8);
+    packet.extend_from_slice(session_id);
+    packet.extend_from_slice(&counter.to_be_bytes());
+    packet.extend_from_slice(ciphertext);
+    packet
+}
+
+pub fn decode_packet(packet: &[u8]) -> Option<ParsedPacket<'_>> {
+    if packet.len() < HANDSHAKE_HEADER_SIZE || packet[0] != WIRE_VERSION {
         return None;
     }
-    if packet[0] != 0x02 {
+
+    let kind = PacketKind::from_u8(packet[1])?;
+    let mut id = [0u8; SESSION_ID_SIZE];
+    id.copy_from_slice(&packet[2..HANDSHAKE_HEADER_SIZE]);
+
+    if kind.is_handshake() {
+        let message = packet.get(HANDSHAKE_HEADER_SIZE..)?;
+        if message.is_empty() {
+            return None;
+        }
+        return Some(ParsedPacket::Handshake {
+            kind,
+            handshake_id: id,
+            message,
+        });
+    }
+
+    if packet.len() < MIN_TRANSPORT_PACKET_SIZE {
         return None;
     }
-    let msg_type = MsgType::from_u8(packet[1])?;
+    let counter = u64::from_be_bytes(
+        packet[HANDSHAKE_HEADER_SIZE..TRANSPORT_HEADER_SIZE]
+            .try_into()
+            .ok()?,
+    );
+    Some(ParsedPacket::Transport {
+        session_id: id,
+        counter,
+        ciphertext: &packet[TRANSPORT_HEADER_SIZE..],
+    })
+}
 
-    let nonce = Nonce::from_slice(&packet[SESSION_ID_OFFSET..HEADER_SIZE]);
-    let aad = [packet[0], packet[1]];
+pub fn encode_transport_plaintext(msg_type: MsgType, payload: &[u8]) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(1 + payload.len());
+    plaintext.push(msg_type as u8);
+    plaintext.extend_from_slice(payload);
+    plaintext
+}
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let plaintext = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: &packet[HEADER_SIZE..],
-                aad: &aad,
-            },
-        )
-        .ok()?;
+pub fn decode_transport_plaintext(plaintext: &[u8]) -> Option<(MsgType, &[u8])> {
+    let (&first, payload) = plaintext.split_first()?;
+    Some((MsgType::from_u8(first)?, payload))
+}
 
-    Some((msg_type, plaintext))
+/// Bind the public handshake identifier and wire version into Noise's
+/// transcript. A modified identifier therefore cannot produce a valid
+/// response or transport state.
+pub fn handshake_prologue(handshake_id: &[u8; SESSION_ID_SIZE]) -> Vec<u8> {
+    let mut prologue = Vec::with_capacity(HANDSHAKE_PROLOGUE_PREFIX.len() + 1 + SESSION_ID_SIZE);
+    prologue.extend_from_slice(HANDSHAKE_PROLOGUE_PREFIX);
+    prologue.push(WIRE_VERSION);
+    prologue.extend_from_slice(handshake_id);
+    prologue
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_key() -> [u8; KEY_SIZE] {
-        [0x42u8; KEY_SIZE]
-    }
-
-    fn test_session_id() -> [u8; SESSION_ID_SIZE] {
-        [0xAA; SESSION_ID_SIZE]
+    #[test]
+    fn handshake_packet_round_trips() {
+        let id = [0x11; SESSION_ID_SIZE];
+        let packet = encode_handshake(PacketKind::HandshakeInit, &id, b"noise-message");
+        assert_eq!(
+            decode_packet(&packet),
+            Some(ParsedPacket::Handshake {
+                kind: PacketKind::HandshakeInit,
+                handshake_id: id,
+                message: b"noise-message",
+            })
+        );
     }
 
     #[test]
-    fn round_trip_data_packet() {
-        let key = test_key();
-        let sid = test_session_id();
-        let payload = b"hello world";
-
-        let packet = encode_packet(payload, &key, MsgType::Data, &sid);
-        assert!(packet.len() >= MIN_PACKET_SIZE);
-
-        let (msg_type, decoded) = decode_packet(&packet, &key).expect("valid packet");
-        assert_eq!(msg_type, MsgType::Data);
-        assert_eq!(&decoded, payload);
+    fn transport_packet_round_trips() {
+        let id = [0x22; SESSION_ID_SIZE];
+        let ciphertext = vec![0xAA; 17];
+        let packet = encode_transport(&id, 42, &ciphertext);
+        assert_eq!(
+            decode_packet(&packet),
+            Some(ParsedPacket::Transport {
+                session_id: id,
+                counter: 42,
+                ciphertext: &ciphertext,
+            })
+        );
     }
 
     #[test]
-    fn round_trip_keepalive() {
-        let key = test_key();
-        let sid = test_session_id();
-
-        let packet = encode_packet(b"", &key, MsgType::Keepalive, &sid);
-        let (msg_type, decoded) = decode_packet(&packet, &key).expect("valid packet");
-        assert_eq!(msg_type, MsgType::Keepalive);
-        assert!(decoded.is_empty());
+    fn transport_semantic_type_is_inside_plaintext() {
+        let plaintext = encode_transport_plaintext(MsgType::Keepalive, KEEPALIVE_PROBE_PAYLOAD);
+        let (kind, payload) = decode_transport_plaintext(&plaintext).expect("plaintext");
+        assert_eq!(kind, MsgType::Keepalive);
+        assert_eq!(payload, KEEPALIVE_PROBE_PAYLOAD);
     }
 
     #[test]
-    fn round_trip_keepalive_probe_and_ack() {
-        let key = test_key();
-        let sid = test_session_id();
+    fn rejects_old_unknown_and_truncated_packets() {
+        assert!(decode_packet(&[]).is_none());
+        assert!(decode_packet(&[0x02; HANDSHAKE_HEADER_SIZE]).is_none());
 
-        for payload in [KEEPALIVE_PROBE_PAYLOAD, KEEPALIVE_ACK_PAYLOAD] {
-            let packet = encode_packet(payload, &key, MsgType::Keepalive, &sid);
-            let (msg_type, decoded) = decode_packet(&packet, &key).expect("valid packet");
-            assert_eq!(msg_type, MsgType::Keepalive);
-            assert_eq!(decoded, payload);
-        }
+        let mut unknown = vec![0u8; HANDSHAKE_HEADER_SIZE];
+        unknown[0] = WIRE_VERSION;
+        unknown[1] = 0xff;
+        assert!(decode_packet(&unknown).is_none());
+
+        let id = [0x33; SESSION_ID_SIZE];
+        let short = encode_transport(&id, 0, &[0u8; 16]);
+        assert!(decode_packet(&short).is_none());
     }
 
     #[test]
-    fn round_trip_handshake_init() {
-        let key = test_key();
-        let sid = test_session_id();
-        let payload = b"handshake-data";
-
-        let packet = encode_packet(payload, &key, MsgType::HandshakeInit, &sid);
-        let (msg_type, decoded) = decode_packet(&packet, &key).expect("valid packet");
-        assert_eq!(msg_type, MsgType::HandshakeInit);
-        assert_eq!(&decoded, payload);
-    }
-
-    #[test]
-    fn wrong_key_fails() {
-        let key_a = test_key();
-        let mut key_b = [0u8; KEY_SIZE];
-        key_b.fill(0xab);
-        let sid = test_session_id();
-
-        let packet = encode_packet(b"secret", &key_a, MsgType::Data, &sid);
-        assert!(decode_packet(&packet, &key_b).is_none());
-    }
-
-    #[test]
-    fn different_sessions_cannot_decrypt() {
-        let key = test_key();
-        let sid_a = [0xAA; SESSION_ID_SIZE];
-        let sid_b = [0xBB; SESSION_ID_SIZE];
-
-        // Same key, different session_id — both should decrypt (key is the same).
-        // Session_id is for routing, not encryption. The key determines decryptability.
-        let packet = encode_packet(b"data", &key, MsgType::Data, &sid_a);
-        assert!(decode_packet(&packet, &key).is_some());
-
-        let packet_b = encode_packet(b"data", &key, MsgType::Data, &sid_b);
-        assert!(decode_packet(&packet_b, &key).is_some());
-    }
-
-    #[test]
-    fn truncated_packet_fails() {
-        let key = test_key();
-        assert!(decode_packet(&[0x02], &key).is_none());
-        assert!(decode_packet(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x00], &key).is_none());
-    }
-
-    #[test]
-    fn tampered_ciphertext_fails() {
-        let key = test_key();
-        let sid = test_session_id();
-
-        let mut packet = encode_packet(b"hello world", &key, MsgType::Data, &sid);
-        let last = packet.len() - 1;
-        packet[last] ^= 0xff;
-
-        assert!(decode_packet(&packet, &key).is_none());
-    }
-
-    #[test]
-    fn tampered_header_fails() {
-        let key = test_key();
-        let sid = test_session_id();
-
-        let mut packet = encode_packet(b"hello world", &key, MsgType::Data, &sid);
-        packet[1] = 0x99; // corrupt msg_type
-
-        assert!(decode_packet(&packet, &key).is_none());
-    }
-
-    #[test]
-    fn extract_session_id_round_trips() {
-        let key = test_key();
-        let sid = test_session_id();
-
-        let packet = encode_packet(b"data", &key, MsgType::Data, &sid);
-        let extracted = extract_session_id(&packet).expect("should extract");
-        assert_eq!(extracted, sid);
-    }
-
-    #[test]
-    fn msg_type_is_handshake() {
-        assert!(MsgType::HandshakeInit.is_handshake());
-        assert!(MsgType::HandshakeResponse.is_handshake());
-        assert!(!MsgType::Data.is_handshake());
-        assert!(!MsgType::Keepalive.is_handshake());
+    fn handshake_id_is_bound_into_the_prologue() {
+        let first = handshake_prologue(&[1u8; SESSION_ID_SIZE]);
+        let second = handshake_prologue(&[2u8; SESSION_ID_SIZE]);
+        assert_ne!(first, second);
+        assert!(first.starts_with(HANDSHAKE_PROLOGUE_PREFIX));
     }
 }
