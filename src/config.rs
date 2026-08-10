@@ -10,6 +10,11 @@ use thiserror::Error;
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub interface: InterfaceConfig,
+    /// Optional Linux forwarding-gateway policy. Merely declaring this block
+    /// does not modify the host; operators must explicitly run a
+    /// `hushwire gateway` command (normally from a dedicated systemd unit).
+    #[serde(default)]
+    pub gateway: Option<GatewayConfig>,
     #[serde(default)]
     pub peer: Vec<PeerConfig>,
 }
@@ -26,6 +31,16 @@ pub struct InterfaceConfig {
     /// Base64-encoded 32-byte static private key for Noise handshake.
     /// Generate with `hushwire genkey`.
     pub private_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct GatewayConfig {
+    /// Host interface that receives packets from downstream LAN clients.
+    pub lan_interface: String,
+    /// TCP MSS advertised in both directions. When omitted, HushWire derives
+    /// the largest safe IPv4 MSS from the configured tunnel MTU.
+    #[serde(default)]
+    pub tcp_mss: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -87,6 +102,21 @@ pub enum ConfigError {
     PeerWithoutAllowedIps(String),
     #[error("mtu must be at least 576, got {0}")]
     MtuTooSmall(u16),
+    #[error("gateway lan_interface cannot be empty")]
+    EmptyGatewayLanInterface,
+    #[error("gateway interface name is not a valid Linux interface name: {0}")]
+    InvalidGatewayInterfaceName(String),
+    #[error("gateway lan_interface and tunnel interface must differ: {0}")]
+    IdenticalGatewayInterfaces(String),
+    #[error(
+        "gateway tcp_mss {mss} is outside the safe range {minimum}..={maximum} for tunnel MTU {mtu}"
+    )]
+    GatewayMssOutOfRange {
+        mss: u16,
+        minimum: u16,
+        maximum: u16,
+        mtu: u16,
+    },
     #[error("peer {0} has an invalid psk: must be base64-encoded 32 bytes")]
     InvalidPsk(String),
     #[error("peer {0} has an invalid public_key: must be base64-encoded 32 bytes")]
@@ -158,6 +188,37 @@ impl Config {
 
         if self.interface.mtu < 576 {
             return Err(ConfigError::MtuTooSmall(self.interface.mtu));
+        }
+
+        if let Some(gateway) = &self.gateway {
+            let lan_interface = gateway.lan_interface.trim();
+            if lan_interface.is_empty() {
+                return Err(ConfigError::EmptyGatewayLanInterface);
+            }
+            for interface in [&self.interface.name, lan_interface] {
+                if !is_valid_linux_interface_name(interface) {
+                    return Err(ConfigError::InvalidGatewayInterfaceName(
+                        interface.to_string(),
+                    ));
+                }
+            }
+            if lan_interface == self.interface.name {
+                return Err(ConfigError::IdenticalGatewayInterfaces(
+                    lan_interface.to_string(),
+                ));
+            }
+            if let Some(mss) = gateway.tcp_mss {
+                let maximum = self.interface.mtu - 40;
+                let minimum = 536;
+                if !(minimum..=maximum).contains(&mss) {
+                    return Err(ConfigError::GatewayMssOutOfRange {
+                        mss,
+                        minimum,
+                        maximum,
+                        mtu: self.interface.mtu,
+                    });
+                }
+            }
         }
 
         if decode_key(&self.interface.private_key).is_none() {
@@ -232,6 +293,14 @@ fn default_mtu() -> u16 {
     1280
 }
 
+fn is_valid_linux_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 /// Decode a base64-encoded 32-byte pre-shared key.
 pub fn decode_psk(psk: &str) -> Option<[u8; 32]> {
     decode_key(psk)
@@ -291,6 +360,7 @@ mod tests {
     fn accepts_minimal_valid_config() {
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![peer("node-b")],
         };
         assert!(config.validate().is_ok());
@@ -300,6 +370,7 @@ mod tests {
     fn accepts_config_with_no_peers() {
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![],
         };
         assert!(config.validate().is_ok());
@@ -309,6 +380,7 @@ mod tests {
     fn rejects_empty_interface_name() {
         let mut config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![],
         };
         config.interface.name = "   ".to_string();
@@ -322,6 +394,7 @@ mod tests {
     fn rejects_mtu_below_minimum() {
         let mut config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![],
         };
         config.interface.mtu = 575;
@@ -335,10 +408,61 @@ mod tests {
     fn accepts_mtu_at_boundary() {
         let mut config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![],
         };
         config.interface.mtu = 576;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_explicit_gateway_policy() {
+        let config = Config {
+            interface: interface(),
+            gateway: Some(GatewayConfig {
+                lan_interface: "en0".to_string(),
+                tcp_mss: Some(1160),
+            }),
+            peer: vec![],
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_gateway_using_the_tunnel_as_its_lan_interface() {
+        let config = Config {
+            interface: interface(),
+            gateway: Some(GatewayConfig {
+                lan_interface: "utun10".to_string(),
+                tcp_mss: None,
+            }),
+            peer: vec![],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::IdenticalGatewayInterfaces(name)) if name == "utun10"
+        ));
+    }
+
+    #[test]
+    fn rejects_gateway_mss_larger_than_tunnel_payload() {
+        let config = Config {
+            interface: interface(),
+            gateway: Some(GatewayConfig {
+                lan_interface: "en0".to_string(),
+                tcp_mss: Some(1241),
+            }),
+            peer: vec![],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::GatewayMssOutOfRange {
+                mss: 1241,
+                maximum: 1240,
+                mtu: 1280,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -347,6 +471,7 @@ mod tests {
         p.name = "".to_string();
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(config.validate(), Err(ConfigError::EmptyPeerName)));
@@ -356,6 +481,7 @@ mod tests {
     fn rejects_duplicate_peer_names() {
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![peer("dup"), peer("dup")],
         };
         assert!(matches!(
@@ -371,6 +497,7 @@ mod tests {
         second.public_key = encoded_key(0x43);
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![first, second],
         };
         assert!(matches!(
@@ -387,6 +514,7 @@ mod tests {
         second.psk = encoded_key(0x43);
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![first, second],
         };
         assert!(matches!(
@@ -402,6 +530,7 @@ mod tests {
         p.allowed_ips = vec![];
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(
@@ -417,6 +546,7 @@ mod tests {
         p.psk = "AAAAAAAAAAAAAAAAAAAAAA==".to_string();
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidPsk(_))));
@@ -428,6 +558,7 @@ mod tests {
         p.psk = "not base64 !!!".to_string();
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidPsk(_))));
@@ -440,6 +571,7 @@ mod tests {
         p.udp_rebind_after = 90;
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(config.validate().is_ok());
@@ -451,6 +583,7 @@ mod tests {
         p.udp_rebind_after = 90;
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(
@@ -468,6 +601,7 @@ mod tests {
         iface.transport = TransportConfig::Tcp;
         let config = Config {
             interface: iface,
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(
@@ -483,6 +617,7 @@ mod tests {
         p.udp_rebind_after = 25;
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(
@@ -520,6 +655,7 @@ mod tests {
         p.session_timeout = Some(30);
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(
@@ -535,6 +671,7 @@ mod tests {
         p.session_timeout = Some(10);
         let config = Config {
             interface: interface(),
+            gateway: None,
             peer: vec![p],
         };
         assert!(matches!(

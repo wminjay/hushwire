@@ -111,6 +111,7 @@ mod tests {
                 mtu: 1280,
                 private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
+            gateway: None,
             peer: vec![
                 peer("broad", "10.77.0.0/24", "127.0.0.1:27778"),
                 peer("specific", "10.77.0.2/32", "127.0.0.1:27779"),
@@ -137,6 +138,7 @@ mod tests {
                 mtu: 1280,
                 private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
+            gateway: None,
             peer: vec![peer("node-b", "10.77.0.2/32", "127.0.0.1:27778")],
         };
 
@@ -155,6 +157,7 @@ mod tests {
                 mtu: 1280,
                 private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
+            gateway: None,
             peer: vec![peer_multi(
                 "hub",
                 &["10.77.0.0/24", "192.168.50.0/24"],
@@ -188,6 +191,7 @@ mod tests {
                 mtu: 1280,
                 private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
+            gateway: None,
             peer: vec![],
         };
 
@@ -207,6 +211,7 @@ mod tests {
                 mtu: 1280,
                 private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             },
+            gateway: None,
             peer: vec![
                 peer("first", "10.77.0.2/32", "127.0.0.1:27778"),
                 peer("second", "10.77.0.2/32", "127.0.0.1:27779"),

@@ -34,6 +34,26 @@ fn cli_can_detach_from_a_transient_launcher_for_safe_commands() {
     );
 }
 
+#[test]
+fn gateway_plan_is_available_without_root_and_describes_symmetric_mss() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hushwire"))
+        .args(["gateway", "plan", "--config", "tests/fixtures/gateway.toml"])
+        .output()
+        .expect("run gateway plan");
+
+    assert!(
+        output.status.success(),
+        "gateway plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("TCP MSS: 1160 (explicit)"));
+    assert!(stdout.contains("-i lan0 -o stb0"));
+    assert!(stdout.contains("-i stb0 -o lan0"));
+    assert!(stdout.contains("No changes made by plan."));
+}
+
 fn gen_keypair() -> (StaticSecret, PublicKey) {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);

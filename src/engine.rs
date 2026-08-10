@@ -881,6 +881,7 @@ mod engine_tests {
                 mtu: 1280,
                 private_key: STANDARD.encode(test.private_key),
             },
+            gateway: None,
             peer: vec![PeerConfig {
                 name: test.peer_name.to_string(),
                 endpoint: test.peer_endpoint,
