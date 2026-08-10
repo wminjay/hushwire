@@ -1,6 +1,6 @@
 # Release Notes
 
-> ⚠️ **Experimental and not audited.** v0.6.x fixes known flaws in the earlier cryptographic construction, but HushWire is not yet suitable for sensitive production traffic.
+> ⚠️ **Experimental and not audited.** Protocol v3 fixes known flaws in the earlier cryptographic construction, but HushWire is not yet suitable for sensitive production traffic.
 
 ## What is HushWire
 
@@ -16,6 +16,22 @@ HushWire is an experimental WireGuard-like IPv4 L3 tunnel focused on observabili
 | `HushWire-aarch64-macos-app.zip` | macOS Apple Silicon personal GUI client |
 
 Each archive has a matching `.sha256` checksum. The GUI app is ad-hoc signed and not notarized; it is intended for personal testing.
+
+## v0.7.0-rc.1: controlled network policy release candidate
+
+This release candidate is wire-compatible with v0.6.x. It is not wire-compatible with the v0.4.x/v0.5.x protocol, so both ends of an older link must be staged, restarted, and rollback-protected as one unit. Existing tunnel keys and TOML remain valid; the new `[gateway]` section is optional.
+
+- The macOS System Extension preview adds an explicit IPv4 full-tunnel mode while retaining `/32` host-route isolation as the safe default.
+- Full tunnel requires confirmation on every start and an authenticated preflight before installing default routes or DNS. The peer endpoint is excluded from the tunnel to prevent routing loops.
+- The macOS UI now exposes effective policy, DNS, handshake, route, endpoint, and peer traffic state, and its layout adapts to the additional information.
+- Disconnect is owned by macOS Packet Tunnel lifecycle handling, avoiding duplicate cleanup and misleading failures; rapid reconnects no longer reuse a just-cancelled local flow.
+- Passive peers recover when a restarted client appears from a new NAT endpoint, without requiring a server restart.
+- Linux can manage an exact, tagged LAN forwarding/NAT policy from optional `[gateway]` configuration, with idempotent reconciliation and ownership-safe cleanup.
+- Direct-distribution entitlements and a notarizing System Extension packager are included, but the signed/notarized application is not part of this automated draft release.
+
+Validation includes Rust formatting, clippy and unit tests; Swift package and macOS bridge smoke tests; UDP/TCP network-namespace recovery with either endpoint restarted; isolated System Extension `/32`, TCP full-tunnel, DNS, endpoint-exclusion, rollback and reboot tests; and live ownership-safe gateway-policy migrations on four LAN gateways without restarting their existing tunnel processes.
+
+This candidate is intentionally published as a draft. Developer ID signing, notarization, clean-machine installation, physical-Mac sleep/wake and interface-switch testing, and a 24-hour soak remain release gates for stable v0.7.0.
 
 ## v0.6.1: shutdown cleanup and preview-state fixes
 
@@ -68,7 +84,7 @@ Do not merge a v0.6 peer into an old production instance until every endpoint at
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
-./hushwire --version       # hushwire 0.6.1
+./hushwire --version       # hushwire 0.7.0-rc.1
 ./hushwire genkey
 openssl rand -base64 32
 sudo ./hushwire up -c my-node.toml
