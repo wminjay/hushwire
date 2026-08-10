@@ -231,10 +231,18 @@ impl SessionManager {
 
     /// Resolve simultaneous initiation deterministically. Both sides compare
     /// the same two random IDs; the smaller ID remains the initiator.
+    ///
+    /// A peer with no configured destination is intentionally passive and
+    /// relies on a learned roaming endpoint. If that remote process restarts,
+    /// our learned endpoint is stale and a locally pending exchange cannot
+    /// reach it. In that case `prefer_inbound` makes the authenticated fresh
+    /// initiation win instead of leaving recovery to a random identifier
+    /// comparison.
     pub fn accept_inbound_initiation(
         &self,
         peer_name: &str,
         remote_handshake_id: &[u8; auth::SESSION_ID_SIZE],
+        prefer_inbound: bool,
     ) -> bool {
         let mut state = self.inner.lock().unwrap();
         if state
@@ -243,6 +251,10 @@ impl SessionManager {
             .is_some_and(|pending| pending.created_at.elapsed() >= HANDSHAKE_ATTEMPT_LIFETIME)
         {
             state.pending_init.remove(peer_name);
+        }
+        if prefer_inbound {
+            state.pending_init.remove(peer_name);
+            return true;
         }
         let Some(local) = state.pending_init.get(peer_name) else {
             return true;
@@ -569,10 +581,12 @@ impl Engine {
                     return Ok(output);
                 };
 
-                if !self
-                    .sessions
-                    .accept_inbound_initiation(&peer_name, &handshake_id)
-                {
+                if !self.sessions.accept_inbound_initiation(
+                    &peer_name,
+                    &handshake_id,
+                    self.peer(&peer_name)
+                        .is_some_and(|peer| !usable_peer_endpoint(peer.endpoint)),
+                ) {
                     return Ok(output);
                 }
                 if let Some(response) =
@@ -867,6 +881,7 @@ mod engine_tests {
                 mtu: 1280,
                 private_key: STANDARD.encode(test.private_key),
             },
+            gateway: None,
             peer: vec![PeerConfig {
                 name: test.peer_name.to_string(),
                 endpoint: test.peer_endpoint,

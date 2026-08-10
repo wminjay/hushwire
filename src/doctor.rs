@@ -5,6 +5,8 @@ use anyhow::Context;
 use hushwire::config::Config;
 use hushwire::router::Router;
 
+use crate::gateway::GatewayPlan;
+
 pub fn run(config: &Config, router: &Router, exit_node: bool) -> anyhow::Result<()> {
     println!("HushWire doctor");
     println!("Interface: {}", config.interface.name);
@@ -27,7 +29,30 @@ pub fn run(config: &Config, router: &Router, exit_node: bool) -> anyhow::Result<
         );
     }
 
+    if config.gateway.is_some() {
+        println!();
+        check_gateway(config);
+    }
+
     Ok(())
+}
+
+fn check_gateway(config: &Config) {
+    println!("Forwarding-gateway checks:");
+    let plan = match GatewayPlan::from_config(config) {
+        Ok(plan) => plan,
+        Err(error) => {
+            println!("FAIL invalid [gateway] policy: {error:#}");
+            return;
+        }
+    };
+    match plan.status() {
+        Ok(status) => plan.print_status(&status),
+        Err(error) => {
+            println!("WARN could not inspect gateway system state: {error:#}");
+            println!("  gateway status requires Linux and permission to inspect iptables");
+        }
+    }
 }
 
 fn check_routes(config: &Config, router: &Router) {

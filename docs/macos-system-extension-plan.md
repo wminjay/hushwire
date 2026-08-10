@@ -117,7 +117,7 @@ Packet I/O adapter
 - CLI 行为保持兼容，由 CLI adapter 组合原有能力。
 - 建立线程安全的 start/stop、packet ingress/egress、stats 和 event API。
 
-当前进度（2026-08-09）：
+当前进度（2026-08-10）：
 
 - `config`、`router`、`packet`、`state`、UDP/TCP transport 已从 CLI 私有模块提升为 library 模块。
 - 会话、握手、rekey、防重放和单边重启恢复状态已迁入 `engine`。
@@ -210,7 +210,7 @@ API 最小集合：
 - App 将 TOML 验证后原子写入权限为 `0600` 的当前用户 App Group 文件；VPN provider configuration 只保存固定存储类型与路由策略，不保存 private key、PSK 或 TOML。System Extension 以 root 身份解析到不同的 App Group 容器，且 macOS 会把 `startTunnel(options:)` 留在可诊断的 session state 中，因此 start options 也不承载密钥：provider 先以“等待配置、无路由”状态启动，再由 App 通过私有 `sendProviderMessage` 通道传递配置，成功后才安装 `/32` network settings。
 - App 已显示接口地址、UDP/TCP、MTU、Peer、Endpoint 和 allowed routes，连接后轮询显示握手、收发字节、last-seen 与真实 endpoint。
 - Packet Tunnel 已接入 `NEPacketTunnelFlow`、Rust Core、Network.framework UDP/TCP transport；TCP 使用与 CLI 相同的 2 字节大端长度帧。
-- 当前 provider 强制 `host-routes-only`：只接受 `/32`，接口使用 `/32` mask，不设置 DNS，也不允许本地固定 listen port；因此尚不能接管默认路由。
+- provider 现在支持默认的 `host-routes-only` 与显式选择的 `full-tunnel-v1`。前者只接受 `/32` 且不修改默认路由/DNS；后者只接受单 Peer、单条 `0.0.0.0/0`，要求每次由 App 明确确认，并在认证预握手完成后才安装默认路由和可选 DNS。
 - 已加入共享 runtime smoke test，覆盖配置解析、公开元数据、start、初始握手、scheduler tick 与 stop；System Extension 无签名构建通过。
 - Apple Development 签名的 build 5 已完成原位升级，并通过隔离的 `10.77.60.1/32` 实例验证真实握手、双向 packet flow、正常连接/断开及接口与路由完整清理；默认路由、DNS、Tailscale 和生产 `27777`/`27779` 实例全程未变。
 - UDP 与 TCP 均完成 64 MiB 双向传输并校验 SHA-256；TCP 在持续下载下发现的非阻塞短写问题已改为有界的完整帧待写队列，修复后未再出现 `EAGAIN` 导致的帧流损坏。
@@ -219,7 +219,12 @@ API 最小集合：
 - `/32` 安全策略已提取为共享校验层并由 Swift smoke test 覆盖，明确拒绝子网/默认路由、固定本地监听端口及无 Peer 路由配置，拒绝发生在安装 VPN settings 之前。
 - 已验证服务端先不可达时 UI 显示 endpoint 未确认和从未收到认证流量；服务恢复后立即自动握手。已连接状态下停止服务约 36 秒后，恢复服务约 4.2 秒完成新握手、约 5–6 秒恢复数据。
 - Linux systemd 停止时发现 `KillMode=control-group` 可能波及临时 `ip route del` 子进程；v0.6.1 加入短时有界重试并保持最终精确路由检查，隔离实例连续三轮 start/stop 均无清理警告和残留路由，两个生产实例保持 active。
-- 待完成：sleep/wake、网络切换、扩展崩溃/升级、长时间运行、全隧道、DNS 与直接分发验收。
+- 在独立 UTM macOS 26.6.1 虚拟机中完成 build 11 / extension build 9 验收：`/32` 模式只安装 `10.77.61.1/32`，默认路由、DNS 与公网出口保持不变；全隧道模式将默认流量导入 utun、把 `154.40.60.58` endpoint 保留在 `en0`、安装 `1.1.1.1`/`1.0.0.1` DNS，并从隔离服务端出口访问公网。断开后路由、DNS 和公网出口均恢复，宿主机网络全程未变。
+- 全隧道服务端不可达时，连续观测到 15 秒预握手窗口内默认路由和 DNS 从未改变，随后自动失败并回到 Disconnected；绕过 App 直接启动的请求在约 1 秒内因缺少本次明确确认而被拒绝。
+- 完成 System Extension build 6 → 7 → 8 原位升级。测试发现快速停止再启动时 `NWParameters.allowLocalEndpointReuse` 会复用刚取消的 UDP 流，使服务端暂时保留旧会话直到 90 秒恢复计时器触发；禁用本地 endpoint 复用后，连续重连使用不同 NAT 端口并约 1 秒完成握手。停止路径也改为由 macOS 在 `stopTunnel` 完成后统一拆除 utun，避免应用重复清理 network settings 的竞态和误报。
+- 完成 extension build 8 → 9 原位升级和 UTM 整机重启验收：重启后扩展仍为 activated/enabled，VPN 保持断开，默认路由与公网出口安全恢复，App 配置继续可用。被动服务端保留旧 endpoint 并持续重试超过 13 分钟时，重启后的客户端仍可在不重启服务端的情况下切换到新 NAT endpoint 并完成握手；UDP/TCP 网络命名空间测试也覆盖了任一端单独重启后的双向恢复。
+- Developer ID 直接分发 entitlement 与本地打包器已经落地；打包器会验证两个 direct profile，按 extension → app 顺序签名，要求 Hardened Runtime/secure timestamp，随后执行 notarize、staple、Gatekeeper 验证并生成校验和。v0.7 及以后 tag 只先产生草稿 Release，避免旧的 ad-hoc GUI 被误当成 System Extension 正式包。
+- 待完成：实体 Mac 的 sleep/wake、Wi-Fi/有线切换、扩展崩溃、24 小时运行、Developer ID 证书/profile 实签、公证和干净环境直接分发验收。
 
 验收顺序：
 

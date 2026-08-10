@@ -56,7 +56,9 @@ final class SystemExtensionController: NSObject, ObservableObject {
   @Published private(set) var peerStatuses: [HushWirePeerStatus] = []
   @Published private(set) var lastHandshake = ""
   @Published private(set) var providerReady = false
-  @Published private(set) var activity = "请选择一份 /32 测试路由配置；密钥不会写入 VPN 系统偏好。"
+  @Published private(set) var selectedRoutePolicy = HushWireRoutePolicy.hostRoutesOnly
+  @Published var dnsServersText = ""
+  @Published private(set) var activity = "请选择网络策略并导入匹配的 TOML；密钥不会写入 VPN 系统偏好。"
 
   private var manager: NETunnelProviderManager?
   private var statusObserver: NSObjectProtocol?
@@ -112,6 +114,32 @@ final class SystemExtensionController: NSObject, ObservableObject {
     }
   }
 
+  var canEditNetworkPolicy: Bool {
+    !isBusy && (vpnStatus == .invalid || vpnStatus == .disconnected)
+  }
+
+  var isFullTunnelSelected: Bool {
+    selectedRoutePolicy == .fullTunnel
+  }
+
+  func selectRoutePolicy(_ routePolicy: HushWireRoutePolicy) {
+    guard canEditNetworkPolicy else {
+      activity = "请先断开当前隧道，再修改网络策略。"
+      return
+    }
+    selectedRoutePolicy = routePolicy
+    if routePolicy == .hostRoutesOnly {
+      dnsServersText = ""
+    }
+    refreshStagedConfiguration(reportFailure: true)
+    if configurationSummary == nil {
+      activity =
+        routePolicy == .fullTunnel
+        ? "已选择全隧道；请导入单 Peer、单条 0.0.0.0/0 的配置。"
+        : "已选择 /32 主机路由；请导入只包含 /32 allowed_ips 的配置。"
+    }
+  }
+
   func requestSystemExtensionActivation() {
     guard !isBusy else { return }
     isBusy = true
@@ -163,8 +191,10 @@ final class SystemExtensionController: NSObject, ObservableObject {
 
   func saveVPNConfiguration() {
     guard !isBusy else { return }
-    guard configurationSummary != nil else {
-      activity = "请先导入并验证 TOML 配置。"
+    do {
+      configurationSummary = try inspectConfiguration(HushWireConfigurationStore.load())
+    } catch {
+      activity = "无法保存 VPN 配置：\(error.localizedDescription)"
       return
     }
     isBusy = true
@@ -173,21 +203,30 @@ final class SystemExtensionController: NSObject, ObservableObject {
   }
 
   func startTunnel() {
-    guard configurationSummary != nil else {
-      activity = "请先导入测试配置。"
-      return
-    }
     guard let manager else {
       activity = "请先保存 VPN 配置。"
       return
     }
     do {
+      let selectedPolicy = try currentNetworkPolicy()
+      let savedPolicy = try Self.networkPolicy(from: manager)
+      guard savedPolicy == selectedPolicy else {
+        throw HushWireCoreError.operation("网络策略或 DNS 已改变，请先保存 VPN 配置。")
+      }
+      configurationSummary = try HushWireConfigurationPolicy.inspect(
+        HushWireConfigurationStore.load(),
+        networkPolicy: selectedPolicy
+      )
       guard let session = manager.connection as? NETunnelProviderSession else {
         throw HushWireCoreError.operation("VPN profile 不是 Packet Tunnel session。")
       }
       providerReady = false
       configurationDeliveryInFlight = false
-      try session.startTunnel(options: nil)
+      let startOptions: [String: NSObject]? =
+        selectedPolicy.routePolicy == .fullTunnel
+        ? [HushWireNetworkPolicy.fullTunnelApprovalOptionKey: NSNumber(value: true)]
+        : nil
+      try session.startTunnel(options: startOptions)
       vpnStatus = manager.connection.status
       activity = "扩展正在启动；连接后将通过私有消息通道传递配置。"
     } catch {
@@ -217,7 +256,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
   }
 
   private func inspectConfiguration(_ data: Data) throws -> HushWireConfigurationSummary {
-    try HushWireHostRouteConfigurationPolicy.inspect(data)
+    try HushWireConfigurationPolicy.inspect(data, networkPolicy: currentNetworkPolicy())
+  }
+
+  private func currentNetworkPolicy() throws -> HushWireNetworkPolicy {
+    try HushWireNetworkPolicy(
+      routePolicy: selectedRoutePolicy,
+      dnsServers: HushWireNetworkPolicy.parseDNSServers(dnsServersText)
+    )
   }
 
   private func refreshProviderStatus() {
@@ -295,17 +341,25 @@ final class SystemExtensionController: NSObject, ObservableObject {
             let object = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
             (object["ok"] as? NSNumber)?.boolValue == true
           else {
-            let detail = response.flatMap { data in
-              (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"]
-                as? String
-            } ?? "扩展没有返回成功响应。"
+            let detail =
+              response.flatMap { data in
+                (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"]
+                  as? String
+              } ?? "扩展没有返回成功响应。"
             self.activity = "安装隧道配置失败：\(detail)"
             self.providerReady = false
             manager.connection.stopVPNTunnel()
             return
           }
           self.providerReady = true
-          self.activity = "隧道已就绪：仅启用 /32 路由，默认路由与 DNS 未修改。"
+          if let summary = self.configurationSummary {
+            self.activity =
+              summary.routePolicy == .fullTunnel
+              ? "全隧道已就绪：endpoint 已直连排除；DNS：\(summary.dnsDescription)。"
+              : "隧道已就绪：仅启用 /32 路由，默认路由与 DNS 未修改。"
+          } else {
+            self.activity = "隧道已就绪。"
+          }
           self.refreshProviderStatus()
         }
       }
@@ -347,6 +401,8 @@ final class SystemExtensionController: NSObject, ObservableObject {
           if createIfMissing {
             self.configureAndSave(existing)
           } else {
+            self.restoreNetworkPolicy(from: existing, reportFailure: reportResult)
+            self.refreshStagedConfiguration(reportFailure: reportResult)
             self.isBusy = false
             if reportResult {
               self.activity = "VPN 配置已存在，并已重新载入系统状态。"
@@ -367,15 +423,27 @@ final class SystemExtensionController: NSObject, ObservableObject {
   }
 
   private func configureAndSave(_ manager: NETunnelProviderManager) {
+    let networkPolicy: HushWireNetworkPolicy
+    do {
+      networkPolicy = try currentNetworkPolicy()
+      configurationSummary = try HushWireConfigurationPolicy.inspect(
+        HushWireConfigurationStore.load(),
+        networkPolicy: networkPolicy
+      )
+    } catch {
+      isBusy = false
+      activity = "保存 VPN 配置失败：\(error.localizedDescription)"
+      return
+    }
     let tunnelProtocol = NETunnelProviderProtocol()
     tunnelProtocol.providerBundleIdentifier = SystemExtensionConstants.extensionBundleIdentifier
-    tunnelProtocol.serverAddress = configurationSummary?.endpoints.first
+    tunnelProtocol.serverAddress =
+      configurationSummary?.endpoints.first
       ?? SystemExtensionConstants.serverAddress
-    tunnelProtocol.providerConfiguration = [
-      "schemaVersion": 2,
+    tunnelProtocol.providerConfiguration = networkPolicy.addingProviderConfiguration(to: [
+      "schemaVersion": 3,
       "configurationStorage": HushWireConfigurationStore.providerStorageKind,
-      "routePolicy": HushWireConfigurationStore.routePolicy,
-    ]
+    ])
     manager.localizedDescription = SystemExtensionConstants.profileDescription
     manager.protocolConfiguration = tunnelProtocol
     manager.isEnabled = true
@@ -391,9 +459,41 @@ final class SystemExtensionController: NSObject, ObservableObject {
         self.manager = manager
         self.isBusy = false
         self.vpnStatus = manager?.connection.status ?? .invalid
-        self.activity = "配置导入完成。VPN 仅引用 App Group 文件，当前只允许 /32 路由。"
+        self.activity =
+          networkPolicy.routePolicy == .fullTunnel
+          ? "VPN 配置已保存为全隧道；连接前仍会再次确认网络影响。"
+          : "VPN 配置已保存为 /32 主机路由；默认路由与 DNS 不会修改。"
       }
     }
+  }
+
+  private func restoreNetworkPolicy(
+    from manager: NETunnelProviderManager,
+    reportFailure: Bool
+  ) {
+    do {
+      let networkPolicy = try Self.networkPolicy(from: manager)
+      selectedRoutePolicy = networkPolicy.routePolicy
+      dnsServersText = networkPolicy.dnsServers.joined(separator: ", ")
+    } catch {
+      selectedRoutePolicy = .hostRoutesOnly
+      dnsServersText = ""
+      if reportFailure {
+        activity = "VPN 网络策略无效：\(error.localizedDescription)"
+      }
+    }
+  }
+
+  private static func networkPolicy(
+    from manager: NETunnelProviderManager
+  ) throws -> HushWireNetworkPolicy {
+    guard
+      let tunnelProtocol = manager.protocolConfiguration as? NETunnelProviderProtocol,
+      let providerConfiguration = tunnelProtocol.providerConfiguration
+    else {
+      throw HushWireCoreError.operation("VPN 配置不存在。")
+    }
+    return try HushWireNetworkPolicy(providerConfiguration: providerConfiguration)
   }
 }
 
@@ -424,7 +524,8 @@ extension SystemExtensionController: OSSystemExtensionRequestDelegate {
       }
       installationState = .installed
       isBusy = false
-      activity = result == .willCompleteAfterReboot
+      activity =
+        result == .willCompleteAfterReboot
         ? "扩展已接受，将在重新启动后完成激活。"
         : "System Extension 已激活。"
     }

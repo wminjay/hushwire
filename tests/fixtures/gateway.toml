@@ -1,0 +1,11 @@
+[interface]
+name = "stb0"
+address = "10.77.99.2/30"
+listen = "0.0.0.0:27779"
+transport = "udp"
+mtu = 1280
+private_key = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
+
+[gateway]
+lan_interface = "lan0"
+tcp_mss = 1160

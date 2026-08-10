@@ -16,11 +16,12 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
+          rustup target add x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies (TUN support)
-        run: sudo apt-get update && sudo apt-get install -y build-essential iproute2 iputils-ping
+        run: sudo apt-get update && sudo apt-get install -y build-essential iproute2 iptables iputils-ping musl-tools
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -29,7 +30,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --release
+        run: |
+          cargo build --release
+          cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Test
         run: cargo test --release
@@ -41,11 +44,14 @@ jobs:
           sudo ./tests/multipeer_netns.sh target/release/hushwire udp
           sudo ./tests/multipeer_netns.sh target/release/hushwire tcp
 
+      - name: Test LAN gateway policy in isolated network namespaces
+        run: sudo ./tests/gateway_netns.sh target/release/hushwire
+
       - name: Upload Linux binary for isolated deployment testing
         uses: actions/upload-artifact@v4
         with:
           name: hushwire-linux-x86_64-ci
-          path: target/release/hushwire
+          path: target/x86_64-unknown-linux-musl/release/hushwire
           retention-days: 1
 
   macos-client:
@@ -69,6 +75,14 @@ jobs:
       - name: Validate control scripts
         run: |
           zsh -n macos/Resources/hushwire-control macos/scripts/build-app.sh
+          bash -n macos/scripts/package-system-extension.sh
+          plutil -lint \
+            macos/SystemExtension/App/HushWire.direct.entitlements \
+            macos/SystemExtension/PacketTunnel/HushWirePacketTunnel.direct.entitlements
+          grep -q 'packet-tunnel-provider-systemextension' \
+            macos/SystemExtension/App/HushWire.direct.entitlements
+          grep -q 'packet-tunnel-provider-systemextension' \
+            macos/SystemExtension/PacketTunnel/HushWirePacketTunnel.direct.entitlements
           set +e
           output=$(macos/Resources/hushwire-control status "$(id -u)")
           result=$?

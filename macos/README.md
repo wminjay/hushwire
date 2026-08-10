@@ -72,10 +72,57 @@ HUSHWIRE_SIGNING=development macos/scripts/build-system-extension.sh
 The development build is written below
 `dist/DerivedData/HushWireSystemSigned/Build/Products/Debug/HushWire.app`. The
 build command does not install or activate the extension. First activation must
-be initiated from the app and approved in macOS System Settings. This preview
-intentionally rejects tunnel startup before calling
-`setTunnelNetworkSettings`, so its lifecycle test cannot add routes or change
-DNS.
+be initiated from the app and approved in macOS System Settings.
+
+### Direct distribution
+
+The System Extension release uses separate Developer ID entitlements because
+Apple requires `packet-tunnel-provider-systemextension` for a Network Extension
+distributed outside the Mac App Store. The container app and extension each
+need a matching Developer ID provisioning profile, and the signing identity must
+be a `Developer ID Application` certificate with its private key in the local
+keychain.
+
+Once those assets exist, the release packager validates the two profiles,
+builds an unsigned Release product, embeds the profiles, signs the extension and
+then the app with Hardened Runtime and a secure timestamp, submits the archive
+for notarization, staples the ticket, runs Gatekeeper validation, and emits the
+final zip plus checksum below `dist/release`:
+
+```bash
+export HUSHWIRE_DEVELOPER_ID_APP_PROFILE=/private/path/HushWire.provisionprofile
+export HUSHWIRE_DEVELOPER_ID_EXTENSION_PROFILE=/private/path/HushWirePacketTunnel.provisionprofile
+export HUSHWIRE_DEVELOPER_ID_IDENTITY='Developer ID Application: Example (TEAMID)'
+export HUSHWIRE_ASC_KEY_PATH=/private/path/AuthKey.p8
+export HUSHWIRE_ASC_KEY_ID=EXAMPLE123
+export HUSHWIRE_ASC_ISSUER_ID=00000000-0000-0000-0000-000000000000
+
+macos/scripts/package-system-extension.sh --check-prerequisites
+macos/scripts/package-system-extension.sh
+```
+
+The packager deliberately has no ad-hoc or unsigned release mode. A development
+build remains available through `HUSHWIRE_SIGNING=development`, but it must not
+be uploaded as a public release. For v0.7 and later, the tag workflow creates a
+draft GitHub release containing the CLI archives; publish it only after adding
+the notarized System Extension zip and its checksum.
+
+The System Extension defaults to the `host-routes-only` policy. In that mode it
+only accepts `/32` entries from `allowed_ips`, leaves the default route and DNS
+unchanged, and requires `interface.listen` to use port `0` so macOS can manage
+the local socket.
+
+The opt-in `full-tunnel-v1` policy is deliberately narrower than the CLI. It
+accepts one peer with one `0.0.0.0/0` route, requires authenticated keepalive
+recovery settings, and installs the peer endpoint as an excluded `/32` route so
+the encrypted transport cannot recursively enter its own tunnel. IPv4 DNS
+servers can be entered separately in the app; leaving the field empty preserves
+the system DNS configuration. The app requires an additional confirmation for
+every full-tunnel start, and the provider rejects starts that bypass that
+confirmation. It also completes an authenticated handshake before installing
+the default route or DNS; a 15-second preflight timeout leaves the existing
+network settings untouched. Test this mode on an isolated machine before using
+it for a primary network path.
 
 The v0.6.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
 

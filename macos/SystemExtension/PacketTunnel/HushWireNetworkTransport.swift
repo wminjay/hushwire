@@ -114,7 +114,10 @@ final class HushWireNetworkTransport: @unchecked Sendable {
     }
 
     let parameters: NWParameters = mode == .udp ? .udp : .tcp
-    parameters.allowLocalEndpointReuse = true
+    // A restarted tunnel must get a fresh local flow. Reusing the just-cancelled
+    // five-tuple can leave the responder addressing its previous encrypted
+    // session until the configured recovery timeout forces a UDP rebind.
+    parameters.allowLocalEndpointReuse = false
     let connection = NWConnection(
       host: NWEndpoint.Host(endpoint.host),
       port: NWEndpoint.Port(rawValue: endpoint.port)!,

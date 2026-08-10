@@ -187,6 +187,77 @@ Peer B must also be configured as an exit node at the operating-system level. Pa
 
 All firewall rules and the original `ip_forward` value are removed when the daemon shuts down.
 
+## LAN Forwarding Gateway
+
+An exit node receives packets *from* HushWire and forwards them to the
+Internet. A LAN forwarding gateway does the opposite: it receives packets from
+downstream devices on a LAN interface and sends them *into* a HushWire tunnel.
+The latter needs symmetric TCP MSS handling when the LAN MTU is larger than the
+tunnel MTU; otherwise a large client-side TLS handshake can hit a PMTU black
+hole even though small packets work.
+
+Gateway policy is explicit and inert by default. Add a `[gateway]` block to a
+Linux gateway's existing tunnel configuration:
+
+```toml
+[interface]
+name = "stb0"
+mtu = 1280
+# ...normal interface settings...
+
+[gateway]
+lan_interface = "eth0"
+# Optional. When omitted, IPv4 MSS is derived as tunnel MTU - 40 (1240 here).
+# A lower value can be selected for a known nested path.
+tcp_mss = 1160
+```
+
+The ordinary `hushwire up` command never applies this block. Inspect and apply
+it with the dedicated lifecycle commands:
+
+```sh
+hushwire gateway plan   -c /etc/hushwire/lax.toml
+sudo hushwire gateway apply  -c /etc/hushwire/lax.toml
+sudo hushwire gateway status -c /etc/hushwire/lax.toml
+sudo hushwire gateway remove -c /etc/hushwire/lax.toml
+```
+
+`apply` is idempotent and installs HushWire-owned Linux iptables rules for:
+
+- TCP MSS in both `LAN -> TUN` and `TUN -> LAN` directions
+- masquerading traffic sent into the tunnel
+- forwarding new LAN traffic and established return traffic
+- IPv4 forwarding, with the original value recorded under `/run/hushwire`
+
+`remove` deletes only rules carrying the matching HushWire ownership tag and
+restores the recorded forwarding value after the last managed gateway in that
+network namespace is removed. State changes are locked so independently
+started HushWire gateway units cannot race with one another. The shipped
+`systemd/hushwire-gateway@.service` runs this lifecycle after
+`hushwire@<name>.service` and retries a short initial race while that service
+creates the TUN interface.
+
+The TUN interface name is the stable gateway-policy identity. Changing the LAN
+interface, MTU, or MSS and running `apply` reconciles stale rules automatically;
+run `remove` before renaming the TUN interface itself.
+
+MSS only controls TCP. UDP and QUIC still depend on a correct tunnel MTU and
+working ICMP Packet Too Big/Fragmentation Needed feedback. `doctor` reports the
+effective gateway interfaces, TUN MTU, owned rule state, and the cumulative
+Linux `IpFragFails` counter without changing the host:
+
+```sh
+sudo hushwire doctor -c /etc/hushwire/lax.toml
+```
+
+The isolated Linux namespace regression can be run without touching the host's
+routes or firewall namespace:
+
+```sh
+cargo build --release
+sudo tests/gateway_netns.sh target/release/hushwire
+```
+
 Use `plan-routes` to see the host routes needed for a config:
 
 ```sh
@@ -232,4 +303,8 @@ cargo run -- plan-routes -c examples/exit-peer-a.toml
 cargo run -- doctor -c examples/exit-peer-a.toml
 sudo cargo run -- up -c examples/node-a.toml
 sudo cargo run -- up -c examples/exit-peer-b.toml --exit-node
+cargo run -- gateway plan -c tests/fixtures/gateway.toml
+sudo cargo run -- gateway apply -c tests/fixtures/gateway.toml
+sudo cargo run -- gateway status -c tests/fixtures/gateway.toml
+sudo cargo run -- gateway remove -c tests/fixtures/gateway.toml
 ```

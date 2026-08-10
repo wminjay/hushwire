@@ -47,6 +47,7 @@ client_veth="hwc${suffix}"
 server_veth="hws${suffix}"
 client_pid=""
 server_pid=""
+client_generation=0
 server_generation=0
 
 cleanup() {
@@ -55,8 +56,10 @@ cleanup() {
     set +e
 
     if [[ $status -ne 0 ]]; then
-        echo "--- client log ---" >&2
-        tail -n 160 "$test_directory/client.log" >&2 2>/dev/null
+        echo "--- restarted client log ---" >&2
+        tail -n 160 "$test_directory/client-2.log" >&2 2>/dev/null
+        echo "--- initial client log ---" >&2
+        tail -n 160 "$test_directory/client-1.log" >&2 2>/dev/null
         echo "--- restarted server log ---" >&2
         tail -n 160 "$test_directory/server-2.log" >&2 2>/dev/null
         echo "--- initial server log ---" >&2
@@ -113,8 +116,9 @@ endpoint = "0.0.0.0:27777"
 allowed_ips = ["10.77.2.2/32"]
 psk = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
 public_key = "fetuos8XUNQuWY6K3bw7D5Qz6Qn9wgqIqHUw5zPEMR0="
-persistent_keepalive = 0
+persistent_keepalive = 1
 udp_rebind_after = 0
+session_timeout = 3
 EOF
 
 ip netns add "$client_namespace"
@@ -139,6 +143,14 @@ start_server() {
         "$binary_path" --log-format text up --config "$test_directory/server.toml" \
         >"$test_directory/server-${server_generation}.log" 2>&1 &
     server_pid=$!
+}
+
+start_client() {
+    client_generation=$((client_generation + 1))
+    ip netns exec "$client_namespace" env RUST_LOG=debug \
+        "$binary_path" --log-format text up --config "$test_directory/client.toml" \
+        >"$test_directory/client-${client_generation}.log" 2>&1 &
+    client_pid=$!
 }
 
 wait_for_interface() {
@@ -179,16 +191,35 @@ wait_for_ping() {
     return 1
 }
 
+wait_for_log() {
+    local process_id=$1
+    local log_path=$2
+    local pattern=$3
+
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$process_id" >/dev/null 2>&1; then
+            echo "HushWire exited while waiting for log pattern: $pattern" >&2
+            tail -n 120 "$log_path" >&2
+            return 1
+        fi
+        if grep -q "$pattern" "$log_path"; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "timed out waiting for log pattern: $pattern" >&2
+    tail -n 120 "$log_path" >&2
+    return 1
+}
+
 start_server
 wait_for_interface \
     "$server_namespace" hwtun-server "$server_pid" "$test_directory/server-1.log"
 
-ip netns exec "$client_namespace" env RUST_LOG=debug \
-    "$binary_path" --log-format text up --config "$test_directory/client.toml" \
-    >"$test_directory/client.log" 2>&1 &
-client_pid=$!
+start_client
 wait_for_interface \
-    "$client_namespace" hwtun-client "$client_pid" "$test_directory/client.log"
+    "$client_namespace" hwtun-client "$client_pid" "$test_directory/client-1.log"
 
 wait_for_ping "$client_namespace" 10.77.2.1
 sleep 2
@@ -206,16 +237,38 @@ wait_for_interface \
 wait_for_ping "$client_namespace" 10.77.2.1
 kill -0 "$client_pid"
 
-grep -q "peer liveness timeout invalidated the old session" "$test_directory/client.log"
+grep -q "peer liveness timeout invalidated the old session" "$test_directory/client-1.log"
 if [[ "$transport" == udp ]]; then
-    grep -q "rebound UDP socket to recover the NAT path" "$test_directory/client.log"
+    grep -q "rebound UDP socket to recover the NAT path" "$test_directory/client-1.log"
 else
-    grep -q "session recovery timeout reached" "$test_directory/client.log"
+    grep -q "session recovery timeout reached" "$test_directory/client-1.log"
 fi
-if [[ $(grep -c "handshake completed (initiator)" "$test_directory/client.log") -lt 2 ]]; then
+if [[ $(grep -c "handshake completed (initiator)" "$test_directory/client-1.log") -lt 2 ]]; then
     echo "client did not complete a second initiator handshake" >&2
     exit 1
 fi
 grep -q "handshake completed (responder)" "$test_directory/server-2.log"
 
-echo "isolated $transport recovery test passed: server restarted, client PID $client_pid survived, ping recovered"
+# Now restart only the initiator while the passive responder survives. The
+# responder is deliberately allowed to begin recovery toward its stale learned
+# endpoint first. A fresh authenticated initiation from the restarted client
+# must take precedence over that unreachable local exchange.
+surviving_server_pid=$server_pid
+kill -TERM "$client_pid"
+wait "$client_pid"
+client_pid=""
+wait_for_log \
+    "$server_pid" "$test_directory/server-2.log" "session recovery timeout reached"
+
+start_client
+wait_for_interface \
+    "$client_namespace" hwtun-client "$client_pid" "$test_directory/client-2.log"
+wait_for_ping "$client_namespace" 10.77.2.1
+kill -0 "$surviving_server_pid"
+grep -q "handshake completed (initiator)" "$test_directory/client-2.log"
+if [[ $(grep -c "handshake completed (responder)" "$test_directory/server-2.log") -lt 2 ]]; then
+    echo "passive server did not accept the restarted client's handshake" >&2
+    exit 1
+fi
+
+echo "isolated $transport recovery test passed: each side restarted independently and the surviving peer recovered"

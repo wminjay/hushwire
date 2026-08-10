@@ -1,5 +1,6 @@
 mod doctor;
 mod firewall;
+mod gateway;
 mod process;
 mod routing;
 mod tunnel;
@@ -68,9 +69,38 @@ enum Command {
         #[arg(long)]
         exit_node: bool,
     },
+    /// Manage the explicit Linux LAN-to-HushWire forwarding gateway policy.
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommand,
+    },
     /// Generate a new static key pair for the Noise handshake.
     /// Prints the private key (for your config) and public key (for your peer's config).
     Genkey,
+}
+
+#[derive(Debug, Subcommand)]
+enum GatewayCommand {
+    /// Print the forwarding, NAT, and MSS changes without applying them.
+    Plan {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Apply the owned forwarding, NAT, and bidirectional MSS rules.
+    Apply {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Inspect the effective gateway interfaces, MTU, forwarding, and rules.
+    Status {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Remove only the rules owned by this gateway configuration.
+    Remove {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -136,6 +166,29 @@ fn main() -> anyhow::Result<()> {
             let config = Config::load(&config)?;
             tunnel::run(config, exit_node).context("tunnel stopped")?;
         }
+        Command::Gateway { command } => match command {
+            GatewayCommand::Plan { config } => {
+                let config = Config::load(&config)?;
+                gateway::GatewayPlan::from_config(&config)?.print();
+            }
+            GatewayCommand::Apply { config } => {
+                let config = Config::load(&config)?;
+                gateway::GatewayPlan::from_config(&config)?.apply()?;
+            }
+            GatewayCommand::Status { config } => {
+                let config = Config::load(&config)?;
+                let plan = gateway::GatewayPlan::from_config(&config)?;
+                let status = plan.status()?;
+                plan.print_status(&status);
+                if !status.healthy() {
+                    anyhow::bail!("gateway configuration is incomplete");
+                }
+            }
+            GatewayCommand::Remove { config } => {
+                let config = Config::load(&config)?;
+                gateway::GatewayPlan::from_config(&config)?.remove()?;
+            }
+        },
         Command::Genkey => {
             genkey();
         }

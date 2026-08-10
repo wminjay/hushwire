@@ -1020,8 +1020,8 @@ mod tests {
         };
         assert_ne!(id_a, id_b);
 
-        let a_accepts_b = manager_a.accept_inbound_initiation("peer", &id_b);
-        let b_accepts_a = manager_b.accept_inbound_initiation("peer", &id_a);
+        let a_accepts_b = manager_a.accept_inbound_initiation("peer", &id_b, false);
+        let b_accepts_a = manager_b.accept_inbound_initiation("peer", &id_a, false);
         assert_ne!(a_accepts_b, b_accepts_a);
 
         let (
@@ -1085,6 +1085,44 @@ mod tests {
         );
         assert!(winner_manager.has_active_session("peer"));
         assert!(responder_manager.has_active_session("peer"));
+    }
+
+    #[test]
+    fn passive_peer_prefers_authenticated_inbound_restart_handshake() {
+        let local_static = StaticSecret::from([0x71; 32]);
+        let remote_static = StaticSecret::from([0x72; 32]);
+        let remote_public = PublicKey::from(&remote_static);
+        let manager = SessionManager::new();
+        let now = Instant::now();
+        let local_packet = manager
+            .start_or_retry_handshake("peer", &local_static, &remote_public, &[0x73; 32], now)
+            .unwrap()
+            .unwrap();
+        let auth::ParsedPacket::Handshake {
+            handshake_id: local_id,
+            ..
+        } = auth::decode_packet(&local_packet).unwrap()
+        else {
+            panic!("local handshake");
+        };
+
+        let mut remote_id = local_id;
+        let position = remote_id
+            .iter()
+            .position(|byte| *byte != u8::MAX)
+            .expect("random identifier cannot be all 0xff in this test");
+        remote_id[position] += 1;
+        remote_id[position + 1..].fill(0);
+
+        // Normal symmetric resolution keeps the smaller local exchange.
+        assert!(!manager.accept_inbound_initiation("peer", &remote_id, false));
+        assert!(manager.has_pending_init("peer"));
+
+        // A passive peer cannot use its stale learned endpoint after the
+        // remote process restarts, so the fresh authenticated inbound exchange
+        // must replace that pending local attempt deterministically.
+        assert!(manager.accept_inbound_initiation("peer", &remote_id, true));
+        assert!(!manager.has_pending_init("peer"));
     }
 
     #[test]
