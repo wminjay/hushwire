@@ -69,26 +69,31 @@ fn check_routes(config: &Config, router: &Router) {
         );
     }
 
-    let full_tunnel_routes: Vec<_> = router
-        .routes()
-        .iter()
-        .filter(|route| route.prefix.prefix_len() == 0)
-        .collect();
+    if !router.excluded_routes().is_empty() {
+        println!("Configured direct-route exclusions:");
+        for route in router.excluded_routes() {
+            println!(
+                "  {} -> physical network (peer {})",
+                route.prefix, route.peer.name
+            );
+        }
+    }
 
-    if full_tunnel_routes.is_empty() {
-        println!("OK no full-tunnel route configured");
+    let endpoint_exception_peers = router.endpoint_exception_peers();
+    if endpoint_exception_peers.is_empty() {
+        println!("OK no route captures a configured peer endpoint");
         return;
     }
 
-    println!("WARN full-tunnel route configured");
+    println!("WARN configured routes capture a peer endpoint");
     println!(
-        "  before routing default traffic into {}, add endpoint exception routes:",
+        "  before routing matching traffic into {}, add endpoint exception routes:",
         config.interface.name
     );
 
-    for route in full_tunnel_routes {
-        let endpoint_ip = route.peer.endpoint.ip();
-        println!("  endpoint {} for peer {}", endpoint_ip, route.peer.name);
+    for peer in endpoint_exception_peers {
+        let endpoint_ip = peer.endpoint.ip();
+        println!("  endpoint {} for peer {}", endpoint_ip, peer.name);
 
         match host_route_to(endpoint_ip) {
             Ok(host_route) => {

@@ -122,6 +122,10 @@ final class SystemExtensionController: NSObject, ObservableObject {
     selectedRoutePolicy == .fullTunnel
   }
 
+  var canConfigureDNS: Bool {
+    selectedRoutePolicy.allowsDNS
+  }
+
   func selectRoutePolicy(_ routePolicy: HushWireRoutePolicy) {
     guard canEditNetworkPolicy else {
       activity = "请先断开当前隧道，再修改网络策略。"
@@ -133,10 +137,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
     }
     refreshStagedConfiguration(reportFailure: true)
     if configurationSummary == nil {
-      activity =
-        routePolicy == .fullTunnel
-        ? "已选择全隧道；请导入单 Peer、单条 0.0.0.0/0 的配置。"
-        : "已选择 /32 主机路由；请导入只包含 /32 allowed_ips 的配置。"
+      switch routePolicy {
+      case .hostRoutesOnly:
+        activity = "已选择 /32 主机路由；请导入只包含 /32 allowed_ips 的配置。"
+      case .splitRoutes:
+        activity = "已选择自定义分流；请导入单 Peer、最多 256 条非默认 IPv4 CIDR。"
+      case .fullTunnel:
+        activity = "已选择默认走隧道；请使用单 Peer、0.0.0.0/0，可用 excluded_ips 添加直连例外。"
+      }
     }
   }
 
@@ -353,10 +361,16 @@ final class SystemExtensionController: NSObject, ObservableObject {
           }
           self.providerReady = true
           if let summary = self.configurationSummary {
-            self.activity =
-              summary.routePolicy == .fullTunnel
-              ? "全隧道已就绪：endpoint 已直连排除；DNS：\(summary.dnsDescription)。"
-              : "隧道已就绪：仅启用 /32 路由，默认路由与 DNS 未修改。"
+            switch summary.routePolicy {
+            case .hostRoutesOnly:
+              self.activity = "隧道已就绪：仅启用 /32 路由，默认路由与 DNS 未修改。"
+            case .splitRoutes:
+              self.activity =
+                "自定义分流已就绪：\(summary.routes.count) 条路由；DNS：\(summary.dnsDescription)。"
+            case .fullTunnel:
+              self.activity =
+                "默认隧道已就绪：\(summary.directRoutes.count) 条直连例外；DNS：\(summary.dnsDescription)。"
+            }
           } else {
             self.activity = "隧道已就绪。"
           }
@@ -438,10 +452,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
     let tunnelProtocol = NETunnelProviderProtocol()
     tunnelProtocol.providerBundleIdentifier = SystemExtensionConstants.extensionBundleIdentifier
     tunnelProtocol.serverAddress =
-      configurationSummary?.endpoints.first
+      configurationSummary?.resolvedEndpoints.first
       ?? SystemExtensionConstants.serverAddress
+    // Make included/excluded route intent deterministic even when the current
+    // LAN has an overlapping route. The endpoint and explicit direct routes
+    // are scoped to the physical interface by Network Extension.
+    tunnelProtocol.enforceRoutes = true
     tunnelProtocol.providerConfiguration = networkPolicy.addingProviderConfiguration(to: [
-      "schemaVersion": 3,
+      "schemaVersion": 4,
       "configurationStorage": HushWireConfigurationStore.providerStorageKind,
     ])
     manager.localizedDescription = SystemExtensionConstants.profileDescription
@@ -459,10 +477,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
         self.manager = manager
         self.isBusy = false
         self.vpnStatus = manager?.connection.status ?? .invalid
-        self.activity =
-          networkPolicy.routePolicy == .fullTunnel
-          ? "VPN 配置已保存为全隧道；连接前仍会再次确认网络影响。"
-          : "VPN 配置已保存为 /32 主机路由；默认路由与 DNS 不会修改。"
+        switch networkPolicy.routePolicy {
+        case .hostRoutesOnly:
+          self.activity = "VPN 配置已保存为 /32 主机路由；默认路由与 DNS 不会修改。"
+        case .splitRoutes:
+          self.activity = "VPN 配置已保存为自定义分流；连接前会先完成认证预握手。"
+        case .fullTunnel:
+          self.activity = "VPN 配置已保存为默认走隧道；连接前仍会再次确认网络影响。"
+        }
       }
     }
   }

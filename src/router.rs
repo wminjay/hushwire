@@ -1,4 +1,5 @@
-use std::net::Ipv4Addr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use ipnet::Ipv4Net;
@@ -11,6 +12,8 @@ use crate::config::{Config, PeerConfig, TransportConfig};
 pub struct Peer {
     pub name: String,
     pub endpoint: std::net::SocketAddr,
+    pub configured_endpoint: crate::config::PeerEndpoint,
+    pub excluded_ips: Vec<Ipv4Net>,
     pub psk: [u8; 32],
     /// Peer's static public key (x25519) for Noise handshake.
     pub public_key: PublicKey,
@@ -26,8 +29,15 @@ pub struct Route {
 }
 
 #[derive(Clone, Debug)]
+pub struct ExcludedRoute {
+    pub prefix: Ipv4Net,
+    pub peer: Arc<Peer>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Router {
     routes: Vec<Route>,
+    excluded_routes: Vec<ExcludedRoute>,
 }
 
 #[derive(Debug, Error)]
@@ -38,14 +48,22 @@ pub enum RouterError {
         first_peer: String,
         second_peer: String,
     },
+    #[error("could not resolve endpoint {endpoint} for peer {peer}: {source}")]
+    EndpointResolution {
+        peer: String,
+        endpoint: crate::config::PeerEndpoint,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Router {
     pub fn new(config: &Config) -> Result<Self, RouterError> {
         let mut routes = Vec::new();
+        let mut excluded_routes = Vec::new();
 
         for peer_config in &config.peer {
-            let peer = Arc::new(peer_from_config(peer_config, config.interface.transport));
+            let peer = Arc::new(peer_from_config(peer_config, config.interface.transport)?);
             for prefix in &peer_config.allowed_ips {
                 if let Some(existing) = routes.iter().find(|route: &&Route| route.prefix == *prefix)
                 {
@@ -61,41 +79,95 @@ impl Router {
                     peer: Arc::clone(&peer),
                 });
             }
+            for prefix in &peer_config.excluded_ips {
+                excluded_routes.push(ExcludedRoute {
+                    prefix: *prefix,
+                    peer: Arc::clone(&peer),
+                });
+            }
         }
 
         routes.sort_by_key(|route| std::cmp::Reverse(route.prefix.prefix_len()));
-        Ok(Self { routes })
+        excluded_routes.sort_by_key(|route| std::cmp::Reverse(route.prefix.prefix_len()));
+        Ok(Self {
+            routes,
+            excluded_routes,
+        })
     }
 
     pub fn lookup(&self, destination: Ipv4Addr) -> Option<&Route> {
-        self.routes
-            .iter()
-            .find(|route| route.prefix.contains(&destination))
+        self.routes.iter().find(|route| {
+            if !route.prefix.contains(&destination) {
+                return false;
+            }
+            let most_specific_exclusion = route
+                .peer
+                .excluded_ips
+                .iter()
+                .filter(|prefix| prefix.contains(&destination))
+                .map(Ipv4Net::prefix_len)
+                .max();
+            most_specific_exclusion
+                .map(|excluded_prefix_length| route.prefix.prefix_len() > excluded_prefix_length)
+                .unwrap_or(true)
+        })
     }
 
     pub fn routes(&self) -> &[Route] {
         &self.routes
     }
+
+    pub fn excluded_routes(&self) -> &[ExcludedRoute] {
+        &self.excluded_routes
+    }
+
+    /// Return one representative peer for each transport endpoint whose IPv4
+    /// address would itself be captured by the configured tunnel routes.
+    pub fn endpoint_exception_peers(&self) -> Vec<&Peer> {
+        let mut seen = HashSet::<IpAddr>::new();
+        let mut peers = Vec::new();
+        for route in &self.routes {
+            let peer = route.peer.as_ref();
+            let IpAddr::V4(endpoint_ip) = peer.endpoint.ip() else {
+                continue;
+            };
+            if peer.endpoint.port() == 0 || endpoint_ip.is_unspecified() {
+                continue;
+            }
+            if self.lookup(endpoint_ip).is_some() && seen.insert(peer.endpoint.ip()) {
+                peers.push(peer);
+            }
+        }
+        peers
+    }
 }
 
-fn peer_from_config(config: &PeerConfig, transport: TransportConfig) -> Peer {
+fn peer_from_config(config: &PeerConfig, transport: TransportConfig) -> Result<Peer, RouterError> {
     let public_key_bytes = crate::config::decode_key(&config.public_key)
         .expect("public_key validated by Config::load");
-    Peer {
+    let endpoint = config
+        .endpoint
+        .resolve()
+        .map_err(|source| RouterError::EndpointResolution {
+            peer: config.name.clone(),
+            endpoint: config.endpoint.clone(),
+            source,
+        })?;
+    Ok(Peer {
         name: config.name.clone(),
-        endpoint: config.endpoint,
+        endpoint,
+        configured_endpoint: config.endpoint.clone(),
+        excluded_ips: config.excluded_ips.clone(),
         psk: crate::config::decode_psk(&config.psk).expect("psk validated by Config::load"),
         public_key: PublicKey::from(public_key_bytes),
         persistent_keepalive: config.persistent_keepalive,
         udp_rebind_after: config.udp_rebind_after,
         session_timeout: config.effective_session_timeout(transport),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use crate::config::InterfaceConfig;
 
     use super::*;
@@ -227,8 +299,9 @@ mod tests {
     fn peer(name: &str, prefix: &str, endpoint: &str) -> PeerConfig {
         PeerConfig {
             name: name.to_string(),
-            endpoint: endpoint.parse::<SocketAddr>().unwrap(),
+            endpoint: endpoint.parse().unwrap(),
             allowed_ips: vec![prefix.parse().unwrap()],
+            excluded_ips: vec![],
             psk: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
@@ -240,13 +313,156 @@ mod tests {
     fn peer_multi(name: &str, prefixes: &[&str], endpoint: &str) -> PeerConfig {
         PeerConfig {
             name: name.to_string(),
-            endpoint: endpoint.parse::<SocketAddr>().unwrap(),
+            endpoint: endpoint.parse().unwrap(),
             allowed_ips: prefixes.iter().map(|p| p.parse().unwrap()).collect(),
+            excluded_ips: vec![],
             psk: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             public_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
             persistent_keepalive: 0,
             udp_rebind_after: 0,
             session_timeout: None,
         }
+    }
+
+    #[test]
+    fn resolves_dns_endpoint_once_when_building_router() {
+        let config = Config {
+            interface: InterfaceConfig {
+                name: "utun10".to_string(),
+                address: "10.77.0.1/24".parse().unwrap(),
+                listen: "127.0.0.1:27777".parse().unwrap(),
+                transport: Default::default(),
+                mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            },
+            gateway: None,
+            peer: vec![peer("node-b", "10.77.0.2/32", "localhost:27778")],
+        };
+
+        let router = Router::new(&config).expect("router");
+        let peer = &router.routes()[0].peer;
+        assert_eq!(peer.configured_endpoint.to_string(), "localhost:27778");
+        assert_eq!(peer.endpoint.port(), 27778);
+        assert!(peer.endpoint.ip().is_loopback());
+        assert!(peer.endpoint.is_ipv4());
+    }
+
+    #[test]
+    fn identifies_only_endpoints_captured_by_tunnel_routes() {
+        let config = Config {
+            interface: InterfaceConfig {
+                name: "utun10".to_string(),
+                address: "10.77.0.1/24".parse().unwrap(),
+                listen: "127.0.0.1:27777".parse().unwrap(),
+                transport: Default::default(),
+                mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            },
+            gateway: None,
+            peer: vec![peer_multi(
+                "home",
+                &["10.0.0.1/32", "192.0.0.0/4"],
+                "192.0.2.10:11063",
+            )],
+        };
+
+        let router = Router::new(&config).expect("router");
+        let exceptions = router.endpoint_exception_peers();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].name, "home");
+
+        let uncaptured = Config {
+            peer: vec![peer("home", "10.0.0.1/32", "192.0.2.10:11063")],
+            ..config
+        };
+        assert!(Router::new(&uncaptured)
+            .unwrap()
+            .endpoint_exception_peers()
+            .is_empty());
+    }
+
+    #[test]
+    fn excluded_ips_override_allowed_routes_without_hiding_other_destinations() {
+        let mut home = peer("home", "0.0.0.0/0", "192.0.2.10:11063");
+        home.excluded_ips = vec![
+            "10.0.0.0/8".parse().unwrap(),
+            "192.168.0.0/16".parse().unwrap(),
+        ];
+        let config = Config {
+            interface: InterfaceConfig {
+                name: "utun10".to_string(),
+                address: "10.77.0.1/24".parse().unwrap(),
+                listen: "127.0.0.1:27777".parse().unwrap(),
+                transport: Default::default(),
+                mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            },
+            gateway: None,
+            peer: vec![home],
+        };
+
+        let router = Router::new(&config).expect("router");
+        assert!(router.lookup("8.8.8.8".parse().unwrap()).is_some());
+        assert!(router.lookup("10.1.2.3".parse().unwrap()).is_none());
+        assert!(router.lookup("192.168.100.1".parse().unwrap()).is_none());
+        assert_eq!(router.excluded_routes().len(), 2);
+    }
+
+    #[test]
+    fn more_specific_allowed_ip_overrides_a_broad_exclusion() {
+        let mut home = peer_multi(
+            "home",
+            &["10.0.0.1/32", "172.16.1.8/32", "0.0.0.0/0"],
+            "192.0.2.10:11063",
+        );
+        home.excluded_ips = vec![
+            "10.0.0.0/8".parse().unwrap(),
+            "172.16.0.0/12".parse().unwrap(),
+        ];
+        let config = Config {
+            interface: InterfaceConfig {
+                name: "utun10".to_string(),
+                address: "10.77.0.1/24".parse().unwrap(),
+                listen: "127.0.0.1:27777".parse().unwrap(),
+                transport: Default::default(),
+                mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            },
+            gateway: None,
+            peer: vec![home],
+        };
+
+        let router = Router::new(&config).expect("router");
+        assert_eq!(
+            router.lookup("10.0.0.1".parse().unwrap()).unwrap().prefix,
+            "10.0.0.1/32".parse().unwrap()
+        );
+        assert_eq!(
+            router.lookup("172.16.1.8".parse().unwrap()).unwrap().prefix,
+            "172.16.1.8/32".parse().unwrap()
+        );
+        assert!(router.lookup("10.0.0.2".parse().unwrap()).is_none());
+        assert!(router.lookup("172.16.1.9".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn explicit_exclusion_also_prevents_redundant_endpoint_exception() {
+        let mut home = peer("home", "0.0.0.0/0", "192.0.2.10:11063");
+        home.excluded_ips = vec!["192.0.2.0/24".parse().unwrap()];
+        let config = Config {
+            interface: InterfaceConfig {
+                name: "utun10".to_string(),
+                address: "10.77.0.1/24".parse().unwrap(),
+                listen: "127.0.0.1:27777".parse().unwrap(),
+                transport: Default::default(),
+                mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            },
+            gateway: None,
+            peer: vec![home],
+        };
+
+        let router = Router::new(&config).expect("router");
+        assert!(router.endpoint_exception_peers().is_empty());
     }
 }

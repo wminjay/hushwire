@@ -6,6 +6,8 @@ struct SystemExtensionContentView: View {
   @ObservedObject var controller: SystemExtensionController
   @State private var isImportingConfiguration = false
   @State private var isConfirmingFullTunnelConnection = false
+  @State private var isShowingAllRoutes = false
+  @State private var isShowingAllDirectRoutes = false
 
   var body: some View {
     ScrollView(.vertical) {
@@ -17,7 +19,7 @@ struct SystemExtensionContentView: View {
           VStack(alignment: .leading, spacing: 2) {
             Text("HushWire System Extension")
               .font(.title2.weight(.semibold))
-            Text("0.7.0 开发预览 · 受控网络策略阶段")
+            Text("开发预览 · 自定义分流阶段")
               .foregroundStyle(.secondary)
           }
           Spacer()
@@ -71,7 +73,7 @@ struct SystemExtensionContentView: View {
               TextField("留空则保持系统 DNS；例如 1.1.1.1, 1.0.0.1", text: $controller.dnsServersText)
                 .textFieldStyle(.roundedBorder)
                 .disabled(
-                  !controller.canEditNetworkPolicy || !controller.isFullTunnelSelected
+                  !controller.canEditNetworkPolicy || !controller.canConfigureDNS
                 )
             }
           }
@@ -98,11 +100,25 @@ struct SystemExtensionContentView: View {
                 Text("Peer / Endpoint").foregroundStyle(.secondary)
                 Text("\(summary.peerCount) / \(summary.endpointDescription)")
                   .font(.system(.body, design: .monospaced))
+                  .lineLimit(2)
+                  .truncationMode(.middle)
+                  .textSelection(.enabled)
               }
               GridRow {
                 Text("允许路由").foregroundStyle(.secondary)
                 Text(summary.routeDescription)
                   .font(.system(.body, design: .monospaced))
+                  .lineLimit(3)
+                  .truncationMode(.middle)
+                  .textSelection(.enabled)
+              }
+              GridRow {
+                Text("直连例外").foregroundStyle(.secondary)
+                Text(summary.directRouteDescription)
+                  .font(.system(.body, design: .monospaced))
+                  .lineLimit(3)
+                  .truncationMode(.middle)
+                  .textSelection(.enabled)
               }
               GridRow {
                 Text("DNS").foregroundStyle(.secondary)
@@ -111,6 +127,40 @@ struct SystemExtensionContentView: View {
               }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            if summary.routes.count > 6 {
+              DisclosureGroup(
+                "查看全部 \(summary.routes.count) 条路由",
+                isExpanded: $isShowingAllRoutes
+              ) {
+                ScrollView([.horizontal, .vertical]) {
+                  Text(summary.routes.joined(separator: "\n"))
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
+                .frame(maxHeight: 180)
+              }
+              .font(.caption)
+              .padding(.top, 8)
+            }
+            if summary.directRoutes.count > 6 {
+              DisclosureGroup(
+                "查看全部 \(summary.directRoutes.count) 条直连例外",
+                isExpanded: $isShowingAllDirectRoutes
+              ) {
+                ScrollView([.horizontal, .vertical]) {
+                  Text(summary.directRoutes.joined(separator: "\n"))
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
+                .frame(maxHeight: 180)
+              }
+              .font(.caption)
+              .padding(.top, 8)
+            }
           } else {
             Text("尚未导入与当前网络策略匹配的配置；本地监听端口必须为 0。")
               .foregroundStyle(.secondary)
@@ -222,14 +272,14 @@ struct SystemExtensionContentView: View {
         _ = error
       }
     }
-    .alert("确认启用 IPv4 全隧道？", isPresented: $isConfirmingFullTunnelConnection) {
+    .alert("确认启用 IPv4 默认隧道？", isPresented: $isConfirmingFullTunnelConnection) {
       Button("取消", role: .cancel) {}
       Button("连接并接管 IPv4 流量", role: .destructive) {
         controller.startTunnel()
       }
     } message: {
       Text(
-        "此操作会把 IPv4 默认路由交给 HushWire。客户端会为 Peer endpoint 保留直连例外；DNS 是否修改取决于上方设置。请仅在已验证的服务端和可恢复网络环境中使用。"
+        "此操作会把 IPv4 默认路由交给 HushWire；TOML 的 excluded_ips 与 Peer endpoint 保持直连。DNS 是否修改取决于上方设置。请仅在已验证的服务端和可恢复网络环境中使用。"
       )
     }
   }
@@ -248,9 +298,13 @@ struct SystemExtensionContentView: View {
   }
 
   private var safetyBoundaryText: String {
-    if controller.isFullTunnelSelected {
-      return "全隧道边界：仅接受单 Peer 的 0.0.0.0/0；自动直连排除 endpoint；仅在显式填写时修改 DNS；不运行提权脚本。"
+    switch controller.selectedRoutePolicy {
+    case .hostRoutesOnly:
+      return "主机路由边界：仅安装 TOML 中的 /32 路由；不设置默认路由、不修改 DNS，也不运行提权脚本。"
+    case .splitRoutes:
+      return "分流边界：单 Peer、最多 256 条非默认 IPv4 CIDR；认证后才安装路由与可选 DNS；自动排除被路由覆盖的 endpoint。"
+    case .fullTunnel:
+      return "默认隧道边界：单 Peer、恰好一条 0.0.0.0/0；可用更具体规则覆盖 excluded_ips；认证后才接管流量。"
     }
-    return "主机路由边界：仅安装 TOML 中的 /32 路由；不设置默认路由、不修改 DNS，也不运行提权脚本。"
   }
 }

@@ -152,7 +152,7 @@ API 最小集合：
 - peer stats snapshot
 - error ownership与字符串释放
 
-当前进度（2026-08-09）：
+当前进度（2026-08-11）：
 
 - ABI v1 已完成，导出 opaque runtime、幂等 start/stop、IP/transport ingress、同步 action/event 回调、peer stats 与公开路由元数据。
 - 配置可直接从内存 TOML 解析，不需要把私钥和 PSK 写入临时文件。
@@ -210,7 +210,8 @@ API 最小集合：
 - App 将 TOML 验证后原子写入权限为 `0600` 的当前用户 App Group 文件；VPN provider configuration 只保存固定存储类型与路由策略，不保存 private key、PSK 或 TOML。System Extension 以 root 身份解析到不同的 App Group 容器，且 macOS 会把 `startTunnel(options:)` 留在可诊断的 session state 中，因此 start options 也不承载密钥：provider 先以“等待配置、无路由”状态启动，再由 App 通过私有 `sendProviderMessage` 通道传递配置，成功后才安装 `/32` network settings。
 - App 已显示接口地址、UDP/TCP、MTU、Peer、Endpoint 和 allowed routes，连接后轮询显示握手、收发字节、last-seen 与真实 endpoint。
 - Packet Tunnel 已接入 `NEPacketTunnelFlow`、Rust Core、Network.framework UDP/TCP transport；TCP 使用与 CLI 相同的 2 字节大端长度帧。
-- provider 现在支持默认的 `host-routes-only` 与显式选择的 `full-tunnel-v1`。前者只接受 `/32` 且不修改默认路由/DNS；后者只接受单 Peer、单条 `0.0.0.0/0`，要求每次由 App 明确确认，并在认证预握手完成后才安装默认路由和可选 DNS。
+- provider 现在支持默认的 `host-routes-only`、`split-routes-v1` 与显式选择的 `full-tunnel-v1`。分流 v1 接受单 Peer、最多 256 条非默认 IPv4 CIDR，DNS 必须被路由覆盖，并与全隧道一样在认证预握手完成后才安装路由和 DNS；全隧道仍只接受单条 `0.0.0.0/0` 且要求每次由 App 明确确认，同时可用少量 `excluded_ips` 表达“默认走隧道、例外直连”，无需维护 WireGuard 式补集列表。
+- Peer endpoint 已支持 DNS 名称；Core 在每个 runtime 创建时解析一次、优先 IPv4，并向 UI 同时公开配置名称与本次解析地址。macOS 会按本次解析结果生成 endpoint 排除路由，CLI 对任何会捕获 endpoint 的分流/全隧道路由也会先安装物理路径例外。
 - 已加入共享 runtime smoke test，覆盖配置解析、公开元数据、start、初始握手、scheduler tick 与 stop；System Extension 无签名构建通过。
 - Apple Development 签名的 build 5 已完成原位升级，并通过隔离的 `10.77.60.1/32` 实例验证真实握手、双向 packet flow、正常连接/断开及接口与路由完整清理；默认路由、DNS、Tailscale 和生产 `27777`/`27779` 实例全程未变。
 - UDP 与 TCP 均完成 64 MiB 双向传输并校验 SHA-256；TCP 在持续下载下发现的非阻塞短写问题已改为有界的完整帧待写队列，修复后未再出现 `EAGAIN` 导致的帧流损坏。

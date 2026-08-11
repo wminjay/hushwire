@@ -268,6 +268,17 @@ fn plan_routes(config: &Config, router: &Router) {
         );
     }
 
+    if !router.excluded_routes().is_empty() {
+        println!();
+        println!("Configured routes that remain on the physical network:");
+        for route in router.excluded_routes() {
+            println!(
+                "  {} (excluded from peer {})",
+                route.prefix, route.peer.name
+            );
+        }
+    }
+
     println!();
     println!("Host routes you need outside HushWire:");
 
