@@ -504,6 +504,14 @@ pub struct Engine {
 impl Engine {
     pub fn new(config: &Config) -> Result<Self, EngineError> {
         let router = Router::new(config)?;
+        Self::with_router(config, router)
+    }
+
+    /// Build an engine with already-resolved routing metadata.
+    ///
+    /// Platform adapters use this to ensure route installation, endpoint
+    /// exceptions, and transport sends all use the same DNS resolution result.
+    pub fn with_router(config: &Config, router: Router) -> Result<Self, EngineError> {
         let local_static = config::decode_key(&config.interface.private_key)
             .ok_or(EngineError::InvalidPrivateKey)?;
         Ok(Self {
@@ -889,8 +897,9 @@ mod engine_tests {
             gateway: None,
             peer: vec![PeerConfig {
                 name: test.peer_name.to_string(),
-                endpoint: test.peer_endpoint,
+                endpoint: test.peer_endpoint.into(),
                 allowed_ips: vec![test.peer_address.parse().unwrap()],
+                excluded_ips: vec![],
                 psk: STANDARD.encode(test.psk),
                 public_key: STANDARD.encode(test.peer_public_key),
                 persistent_keepalive: 5,

@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::str::FromStr;
 
 use ipnet::Ipv4Net;
 use serde::Deserialize;
@@ -54,8 +56,13 @@ pub enum TransportConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct PeerConfig {
     pub name: String,
-    pub endpoint: SocketAddr,
+    pub endpoint: PeerEndpoint,
     pub allowed_ips: Vec<Ipv4Net>,
+    /// Direct-route rules covered by this peer's `allowed_ips`. Rules use
+    /// longest-prefix matching, so a more-specific allowed prefix can opt a
+    /// host back into the tunnel; an exact-length exclusion wins the tie.
+    #[serde(default)]
+    pub excluded_ips: Vec<Ipv4Net>,
     /// Base64-encoded 32-byte pre-shared key (authentication factor).
     pub psk: String,
     /// Base64-encoded 32-byte static public key of this peer (for Noise handshake).
@@ -76,6 +83,128 @@ pub struct PeerConfig {
     /// `udp_rebind_after` behavior.
     #[serde(default)]
     pub session_timeout: Option<u16>,
+}
+
+/// A configured peer endpoint whose host may be an IP literal or DNS name.
+///
+/// Parsing configuration deliberately performs no network I/O. The router
+/// resolves DNS names once while creating a runtime, before any tunnel routes
+/// or DNS settings are installed. Creating a new runtime (including a normal
+/// macOS reconnect) therefore refreshes a dynamic-DNS endpoint.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PeerEndpoint {
+    host: String,
+    port: u16,
+    literal: Option<SocketAddr>,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum PeerEndpointParseError {
+    #[error("endpoint must be an IP address or DNS name followed by :port")]
+    InvalidFormat,
+    #[error("endpoint has an invalid port")]
+    InvalidPort,
+    #[error("endpoint has an invalid DNS name")]
+    InvalidDnsName,
+}
+
+impl PeerEndpoint {
+    pub fn resolve(&self) -> io::Result<SocketAddr> {
+        if let Some(literal) = self.literal {
+            return Ok(literal);
+        }
+
+        let addresses: Vec<_> = (self.host.as_str(), self.port).to_socket_addrs()?.collect();
+        addresses
+            .iter()
+            .find(|address| address.is_ipv4())
+            .or_else(|| addresses.first())
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("DNS returned no addresses for {}", self.host),
+                )
+            })
+    }
+
+    pub fn is_dns_name(&self) -> bool {
+        self.literal.is_none()
+    }
+}
+
+impl std::fmt::Display for PeerEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(literal) = self.literal {
+            write!(formatter, "{literal}")
+        } else {
+            write!(formatter, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+impl From<SocketAddr> for PeerEndpoint {
+    fn from(value: SocketAddr) -> Self {
+        Self {
+            host: value.ip().to_string(),
+            port: value.port(),
+            literal: Some(value),
+        }
+    }
+}
+
+impl FromStr for PeerEndpoint {
+    type Err = PeerEndpointParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(literal) = value.parse::<SocketAddr>() {
+            return Ok(literal.into());
+        }
+
+        let (host, raw_port) = value
+            .rsplit_once(':')
+            .ok_or(PeerEndpointParseError::InvalidFormat)?;
+        if host.is_empty() || host.contains(':') || host.trim() != host {
+            return Err(PeerEndpointParseError::InvalidFormat);
+        }
+        let port = raw_port
+            .parse::<u16>()
+            .map_err(|_| PeerEndpointParseError::InvalidPort)?;
+        if !valid_dns_name(host) {
+            return Err(PeerEndpointParseError::InvalidDnsName);
+        }
+
+        Ok(Self {
+            host: host.to_string(),
+            port,
+            literal: None,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerEndpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+fn valid_dns_name(value: &str) -> bool {
+    let value = value.strip_suffix('.').unwrap_or(value);
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +229,12 @@ pub enum ConfigError {
     DuplicatePeerPublicKey { first: String, second: String },
     #[error("peer {0} has no allowed_ips")]
     PeerWithoutAllowedIps(String),
+    #[error("peer {peer} contains duplicate excluded_ips entry {prefix}")]
+    DuplicateExcludedIp { peer: String, prefix: Ipv4Net },
+    #[error("peer {peer} excludes {prefix}, but no allowed_ips entry covers it")]
+    ExcludedIpNotCovered { peer: String, prefix: Ipv4Net },
+    #[error("peer {0} cannot exclude 0.0.0.0/0")]
+    ExcludedDefaultRoute(String),
     #[error("mtu must be at least 576, got {0}")]
     MtuTooSmall(u16),
     #[error("gateway lan_interface cannot be empty")]
@@ -238,6 +373,28 @@ impl Config {
             if peer.allowed_ips.is_empty() {
                 return Err(ConfigError::PeerWithoutAllowedIps(peer.name.clone()));
             }
+            let mut exclusions = HashSet::new();
+            for prefix in &peer.excluded_ips {
+                if prefix.prefix_len() == 0 {
+                    return Err(ConfigError::ExcludedDefaultRoute(peer.name.clone()));
+                }
+                if !exclusions.insert(*prefix) {
+                    return Err(ConfigError::DuplicateExcludedIp {
+                        peer: peer.name.clone(),
+                        prefix: *prefix,
+                    });
+                }
+                let covered = peer.allowed_ips.iter().any(|allowed| {
+                    allowed.prefix_len() <= prefix.prefix_len()
+                        && allowed.contains(&prefix.network())
+                });
+                if !covered {
+                    return Err(ConfigError::ExcludedIpNotCovered {
+                        peer: peer.name.clone(),
+                        prefix: *prefix,
+                    });
+                }
+            }
             let psk =
                 decode_psk(&peer.psk).ok_or_else(|| ConfigError::InvalidPsk(peer.name.clone()))?;
             if let Some(first) = psks.insert(psk, peer.name.clone()) {
@@ -343,12 +500,132 @@ mod tests {
             name: name.to_string(),
             endpoint: "127.0.0.1:27778".parse().unwrap(),
             allowed_ips: vec!["10.77.0.2/32".parse().unwrap()],
+            excluded_ips: vec![],
             psk: VALID_PSK.to_string(),
             public_key: VALID_KEY.to_string(),
             persistent_keepalive: 0,
             udp_rebind_after: 0,
             session_timeout: None,
         }
+    }
+
+    #[test]
+    fn parses_ip_and_dns_peer_endpoints_without_resolving() {
+        let literal: PeerEndpoint = "192.0.2.10:27777".parse().unwrap();
+        assert_eq!(literal.to_string(), "192.0.2.10:27777");
+        assert!(!literal.is_dns_name());
+        assert_eq!(
+            literal.resolve().unwrap(),
+            "192.0.2.10:27777".parse().unwrap()
+        );
+
+        let hostname: PeerEndpoint = "home.minjie.wang:11063".parse().unwrap();
+        assert_eq!(hostname.to_string(), "home.minjie.wang:11063");
+        assert!(hostname.is_dns_name());
+    }
+
+    #[test]
+    fn resolves_hostname_endpoints_with_ipv4_preference() {
+        let endpoint: PeerEndpoint = "localhost:27777".parse().unwrap();
+        let resolved = endpoint.resolve().unwrap();
+        assert_eq!(resolved.port(), 27777);
+        assert!(resolved.ip().is_loopback());
+        assert!(resolved.is_ipv4());
+    }
+
+    #[test]
+    fn rejects_malformed_peer_endpoints() {
+        for value in [
+            "home.minjie.wang",
+            "home.minjie.wang:not-a-port",
+            "-home.example:11063",
+            "home..example:11063",
+            "unbracketed::1:11063",
+        ] {
+            assert!(value.parse::<PeerEndpoint>().is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn config_parse_accepts_a_dns_peer_endpoint() {
+        let text = format!(
+            r#"
+[interface]
+name = "utun10"
+address = "10.77.0.2/30"
+listen = "0.0.0.0:0"
+private_key = "{VALID_KEY}"
+
+[[peer]]
+name = "home"
+endpoint = "home.minjie.wang:11063"
+allowed_ips = ["10.77.0.1/32"]
+psk = "{VALID_PSK}"
+public_key = "{VALID_KEY}"
+"#
+        );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(
+            config.peer[0].endpoint.to_string(),
+            "home.minjie.wang:11063"
+        );
+    }
+
+    #[test]
+    fn accepts_covered_excluded_ips() {
+        let mut p = peer("home");
+        p.allowed_ips = vec!["0.0.0.0/0".parse().unwrap()];
+        p.excluded_ips = vec![
+            "10.0.0.0/8".parse().unwrap(),
+            "192.168.0.0/16".parse().unwrap(),
+        ];
+        let config = Config {
+            interface: interface(),
+            gateway: None,
+            peer: vec![p],
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_uncovered_duplicate_and_default_exclusions() {
+        let mut uncovered = peer("home");
+        uncovered.excluded_ips = vec!["192.168.0.0/16".parse().unwrap()];
+        let config = Config {
+            interface: interface(),
+            gateway: None,
+            peer: vec![uncovered],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ExcludedIpNotCovered { .. })
+        ));
+
+        let mut duplicate = peer("home");
+        duplicate.allowed_ips = vec!["0.0.0.0/0".parse().unwrap()];
+        duplicate.excluded_ips = vec!["10.0.0.0/8".parse().unwrap(), "10.0.0.0/8".parse().unwrap()];
+        let config = Config {
+            interface: interface(),
+            gateway: None,
+            peer: vec![duplicate],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::DuplicateExcludedIp { .. })
+        ));
+
+        let mut default = peer("home");
+        default.allowed_ips = vec!["0.0.0.0/0".parse().unwrap()];
+        default.excluded_ips = vec!["0.0.0.0/0".parse().unwrap()];
+        let config = Config {
+            interface: interface(),
+            gateway: None,
+            peer: vec![default],
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ExcludedDefaultRoute(_))
+        ));
     }
 
     fn encoded_key(byte: u8) -> String {

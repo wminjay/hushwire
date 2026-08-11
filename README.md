@@ -145,7 +145,7 @@ For automatic recovery when an established UDP path becomes one-way, enable rebi
 ```toml
 [[peer]]
 name = "exit"
-endpoint = "203.0.113.20:27777"
+endpoint = "home.example.net:27777"
 allowed_ips = ["0.0.0.0/0"]
 psk = "<base64-32-byte-psk>"
 public_key = "<base64-peer-public-key>"
@@ -156,6 +156,32 @@ udp_rebind_after = 90
 With `udp_rebind_after` enabled, persistent keepalives become authenticated probes. The peer returns an authenticated acknowledgement, so the client can distinguish an idle tunnel from a broken return path. If no authenticated packet arrives for the configured number of seconds, HushWire binds a fresh ephemeral UDP source port, discards the timed-out peer's stale session, and starts a fresh Noise handshake. Because rebinding changes the interface-wide socket, it also sends a one-shot authenticated keepalive to every other active peer—including peers with periodic keepalives disabled—so their learned endpoints move to the new port.
 
 `udp_rebind_after` is disabled by default and must be greater than `persistent_keepalive`. Enable it on NATed clients, not on a public exit node: rebinding changes the interface-wide UDP socket and therefore the source port used for every peer on that interface. Both ends must run the v3 wire protocol. Real tunnel traffic starts a cold handshake immediately; a configured periodic keepalive can also start it when its interval becomes due. An unanswered exchange is retried every five seconds and replaced with a fresh handshake after 30 seconds.
+
+Peer endpoints accept either an IP literal or a DNS name followed by a port.
+DNS names are resolved once when a runtime is created, with IPv4 preferred when
+both address families are returned. Reconnect to refresh a dynamic-DNS result.
+Route installation and transport sends share that single resolved address.
+
+For “tunnel everything except a few destinations,” use an explicit exclusion
+list instead of expanding the mathematical complement into dozens of routes:
+
+```toml
+[[peer]]
+name = "home"
+endpoint = "home.example.net:11063"
+allowed_ips = ["0.0.0.0/0"]
+excluded_ips = ["10.0.0.0/8", "203.0.113.0/24"]
+```
+
+Every `excluded_ips` prefix must be covered by the same peer's `allowed_ips`.
+HushWire rejects duplicate, uncovered, and `0.0.0.0/0` exclusions. The packet
+router drops excluded destinations defensively, while platform route adapters
+keep them on the physical network.
+
+Included and excluded rules use longest-prefix matching, with an exclusion
+winning an exact-length tie. This permits a specific tunnel destination inside
+a broader direct range, for example `allowed_ips = ["10.0.0.1/32",
+"0.0.0.0/0"]` together with `excluded_ips = ["10.0.0.0/8"]`.
 
 `faketcp` and `websocket` transports were considered and dropped: they add significant complexity without fitting HushWire's goal of being an observable, debuggable tunnel. The `PacketTransport` trait is designed so a new transport can be added without touching the data path.
 
@@ -291,7 +317,12 @@ If peer B is an exit node, run it with `--exit-node` so HushWire installs forwar
 sudo cargo run -- up -c examples/exit-peer-b.toml --exit-node
 ```
 
-On startup HushWire installs the host routes implied by each peer's `allowed_ips` (including the split `0.0.0.0/1` + `128.0.0.0/1` for a full-tunnel route, plus a host-route exception for the peer endpoint so the tunnel does not loop back into itself). Routes and firewall rules are removed on shutdown.
+On startup HushWire installs the routes implied by each peer's `allowed_ips`
+(including the split `0.0.0.0/1` + `128.0.0.0/1` for a full-tunnel route). If
+any full- or split-tunnel route would capture a peer endpoint, HushWire first
+pins that resolved endpoint to its existing physical gateway so the encrypted
+transport cannot loop back into itself. Failure to install this safety route
+aborts route setup. Routes and firewall rules are removed on shutdown.
 
 ## Commands
 

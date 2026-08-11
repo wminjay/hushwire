@@ -112,10 +112,20 @@ only accepts `/32` entries from `allowed_ips`, leaves the default route and DNS
 unchanged, and requires `interface.listen` to use port `0` so macOS can manage
 the local socket.
 
+The `split-routes-v1` policy accepts one peer with up to 256 arbitrary IPv4
+CIDRs, but deliberately rejects `0.0.0.0/0`. It resolves a DNS endpoint before
+installing network settings and adds an excluded `/32` whenever the route set
+would capture that resolved address. Optional IPv4 DNS servers must themselves
+be covered by `allowed_ips`; this prevents switching the Mac to an unreachable
+resolver. The provider completes an authenticated preflight handshake before
+installing any split routes or DNS, so an unreachable server leaves the current
+network unchanged.
+
 The opt-in `full-tunnel-v1` policy is deliberately narrower than the CLI. It
 accepts one peer with one `0.0.0.0/0` route, requires authenticated keepalive
-recovery settings, and installs the peer endpoint as an excluded `/32` route so
-the encrypted transport cannot recursively enter its own tunnel. IPv4 DNS
+recovery settings, and installs the peer endpoint as an excluded `/32` when no
+configured exclusion already keeps it direct, so the encrypted transport cannot
+recursively enter its own tunnel. IPv4 DNS
 servers can be entered separately in the app; leaving the field empty preserves
 the system DNS configuration. The app requires an additional confirmation for
 every full-tunnel start, and the provider rejects starts that bypass that
@@ -123,6 +133,29 @@ confirmation. It also completes an authenticated handshake before installing
 the default route or DNS; a 15-second preflight timeout leaves the existing
 network settings untouched. Test this mode on an isolated machine before using
 it for a primary network path.
+
+That same policy supports concise default-with-exceptions profiles through
+`excluded_ips`. The provider installs those CIDRs as Network Extension excluded
+routes, adds an endpoint `/32` only when the configured exceptions do not
+already cover it, and shows the effective direct routes in the app:
+
+```toml
+allowed_ips = ["0.0.0.0/0"]
+excluded_ips = ["10.0.0.0/8", "203.0.113.0/24"]
+```
+
+The saved tunnel profile enables `enforceRoutes`, so an overlapping route on
+the current LAN does not silently override the declared tunnel/direct policy.
+This is especially important for private DNS or internal addresses; add every
+LAN prefix that must remain local to `excluded_ips` before connecting.
+
+Rules use longest-prefix matching. A more-specific `allowed_ips` entry can
+therefore route a host through HushWire from inside a wider direct exception:
+
+```toml
+allowed_ips = ["10.0.0.1/32", "0.0.0.0/0"]
+excluded_ips = ["10.0.0.0/8"]
+```
 
 The v0.6.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
 
@@ -155,7 +188,17 @@ persistent_keepalive = 25
 udp_rebind_after = 90
 ```
 
-`endpoint` currently has to be an IP address and port, not a hostname. For a split tunnel, replace `0.0.0.0/0` with only the networks that should use HushWire.
+`endpoint` may be an IP address or DNS name followed by a port. It is resolved
+once per newly created runtime, with IPv4 preferred, and the UI displays both
+the configured name and resolved address. Reconnect after a dynamic-DNS change.
+For a split tunnel, select **自定义分流**, replace `0.0.0.0/0` with only the
+networks that should use HushWire, and ensure any configured DNS server is
+included in those networks.
+
+If almost everything should use HushWire, select **默认走隧道** and use one
+`0.0.0.0/0` `allowed_ips` entry plus the small set of direct destinations in
+`excluded_ips`. This is shorter and less error-prone than copying a generated
+WireGuard complement list.
 
 For TCP profiles, a nonzero `persistent_keepalive` automatically enables stale
 session recovery after three keepalive intervals (minimum 15 seconds). Add

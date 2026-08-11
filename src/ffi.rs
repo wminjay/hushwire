@@ -15,9 +15,10 @@ use std::time::Instant;
 
 use crate::config::{Config, TransportConfig};
 use crate::engine::{Engine, EngineAction, EngineEvent, EngineOutput, HandshakeRole};
+use crate::router::Router;
 use crate::scheduler::EngineScheduler;
 
-pub const HW_CORE_ABI_VERSION: u32 = 1;
+pub const HW_CORE_ABI_VERSION: u32 = 2;
 const ERROR_MESSAGE_CAPACITY: usize = 512;
 
 #[repr(i32)]
@@ -75,7 +76,9 @@ pub struct HwInterfaceConfig {
 pub struct HwRouteConfig {
     pub network: [u8; 4],
     pub prefix_length: u8,
-    pub reserved: [u8; 3],
+    /// `1` for an included tunnel route and `2` for a direct-route exclusion.
+    pub route_kind: u8,
+    pub reserved: [u8; 2],
     pub endpoint: HwEndpoint,
     pub persistent_keepalive: u16,
     pub udp_rebind_after: u16,
@@ -132,6 +135,8 @@ pub type HwRouteCallback = Option<
         context: *mut c_void,
         peer_name: *const u8,
         peer_name_length: usize,
+        configured_endpoint: *const u8,
+        configured_endpoint_length: usize,
         route: *const HwRouteConfig,
     ),
 >;
@@ -190,6 +195,7 @@ struct Lifecycle {
 /// Opaque runtime handle exposed to C.
 pub struct HwRuntime {
     config: Config,
+    router: Router,
     callbacks: RuntimeCallbacks,
     lifecycle: Mutex<Lifecycle>,
     scheduler: Mutex<Option<EngineScheduler>>,
@@ -351,7 +357,9 @@ pub unsafe extern "C" fn hw_runtime_create(
         })?;
         let config = Config::parse(text)
             .map_err(|cause| FfiFailure::new(HwStatus::ConfigError, cause.to_string()))?;
-        Engine::new(&config)
+        let router = Router::new(&config)
+            .map_err(|cause| FfiFailure::new(HwStatus::ConfigError, cause.to_string()))?;
+        Engine::with_router(&config, router.clone())
             .map_err(|cause| FfiFailure::new(HwStatus::ConfigError, cause.to_string()))?;
 
         let callbacks = callbacks.as_ref().ok_or_else(|| {
@@ -372,6 +380,7 @@ pub unsafe extern "C" fn hw_runtime_create(
 
         Ok::<_, FfiFailure>(Box::into_raw(Box::new(HwRuntime {
             config,
+            router,
             callbacks: RuntimeCallbacks {
                 context: callbacks.context as usize,
                 send_transport,
@@ -442,7 +451,7 @@ pub unsafe extern "C" fn hw_runtime_start(
         }
         if lifecycle.engine.is_none() {
             lifecycle.engine = Some(
-                Engine::new(&runtime.config)
+                Engine::with_router(&runtime.config, runtime.router.clone())
                     .map_err(|cause| FfiFailure::new(HwStatus::EngineError, cause.to_string()))?,
             );
             *runtime.scheduler.lock().map_err(|_| {
@@ -761,21 +770,49 @@ pub unsafe extern "C" fn hw_runtime_visit_routes(
         let callback = callback.ok_or_else(|| {
             FfiFailure::new(HwStatus::InvalidArgument, "route callback must not be null")
         })?;
-        for peer in &runtime.config.peer {
-            let session_timeout =
-                peer.effective_session_timeout(runtime.config.interface.transport);
-            for allowed_ip in &peer.allowed_ips {
-                let route = HwRouteConfig {
-                    network: allowed_ip.network().octets(),
-                    prefix_length: allowed_ip.prefix_len(),
-                    reserved: [0; 3],
-                    endpoint: endpoint_to_ffi(peer.endpoint),
-                    persistent_keepalive: peer.persistent_keepalive,
-                    udp_rebind_after: peer.udp_rebind_after,
-                    session_timeout,
-                };
-                callback(context, peer.name.as_ptr(), peer.name.len(), &route);
-            }
+        for configured_route in runtime.router.routes() {
+            let peer = &configured_route.peer;
+            let configured_endpoint = peer.configured_endpoint.to_string();
+            let route = HwRouteConfig {
+                network: configured_route.prefix.network().octets(),
+                prefix_length: configured_route.prefix.prefix_len(),
+                route_kind: 1,
+                reserved: [0; 2],
+                endpoint: endpoint_to_ffi(peer.endpoint),
+                persistent_keepalive: peer.persistent_keepalive,
+                udp_rebind_after: peer.udp_rebind_after,
+                session_timeout: peer.session_timeout,
+            };
+            callback(
+                context,
+                peer.name.as_ptr(),
+                peer.name.len(),
+                configured_endpoint.as_ptr(),
+                configured_endpoint.len(),
+                &route,
+            );
+        }
+        for configured_route in runtime.router.excluded_routes() {
+            let peer = &configured_route.peer;
+            let configured_endpoint = peer.configured_endpoint.to_string();
+            let route = HwRouteConfig {
+                network: configured_route.prefix.network().octets(),
+                prefix_length: configured_route.prefix.prefix_len(),
+                route_kind: 2,
+                reserved: [0; 2],
+                endpoint: endpoint_to_ffi(peer.endpoint),
+                persistent_keepalive: peer.persistent_keepalive,
+                udp_rebind_after: peer.udp_rebind_after,
+                session_timeout: peer.session_timeout,
+            };
+            callback(
+                context,
+                peer.name.as_ptr(),
+                peer.name.len(),
+                configured_endpoint.as_ptr(),
+                configured_endpoint.len(),
+                &route,
+            );
         }
         Ok(())
     })

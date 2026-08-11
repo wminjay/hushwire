@@ -3,6 +3,7 @@ import Network
 
 enum HushWireRoutePolicy: String, CaseIterable, Identifiable, Sendable {
   case hostRoutesOnly = "host-routes-only"
+  case splitRoutes = "split-routes-v1"
   case fullTunnel = "full-tunnel-v1"
 
   var id: String { rawValue }
@@ -10,7 +11,8 @@ enum HushWireRoutePolicy: String, CaseIterable, Identifiable, Sendable {
   var title: String {
     switch self {
     case .hostRoutesOnly: "主机路由（/32）"
-    case .fullTunnel: "全隧道（IPv4）"
+    case .splitRoutes: "自定义分流"
+    case .fullTunnel: "默认走隧道"
     }
   }
 
@@ -18,10 +20,16 @@ enum HushWireRoutePolicy: String, CaseIterable, Identifiable, Sendable {
     switch self {
     case .hostRoutesOnly:
       "只把 TOML 中明确列出的 /32 地址交给 HushWire。"
+    case .splitRoutes:
+      "按 TOML 中的 IPv4 CIDR 精确分流；不接受默认路由，并自动保护 Peer endpoint。"
     case .fullTunnel:
-      "把 IPv4 默认路由交给 HushWire，并为真实 endpoint 保留直连例外。"
+      "默认把 IPv4 交给 HushWire；TOML 的 excluded_ips 与真实 endpoint 保持直连。"
     }
   }
+
+  var allowsDNS: Bool { self != .hostRoutesOnly }
+
+  var requiresAuthenticatedPreflight: Bool { self != .hostRoutesOnly }
 }
 
 struct HushWireNetworkPolicy: Equatable, Sendable {
@@ -124,6 +132,28 @@ struct HushWireIPv4RouteSpec: Equatable, Sendable {
         .joined(separator: ".")
     }
   }
+
+  func contains(_ address: String) -> Bool {
+    guard
+      prefixLength <= 32,
+      let routeAddress = IPv4Address(network),
+      let targetAddress = IPv4Address(address)
+    else { return false }
+    let routeValue = Self.integerValue(routeAddress)
+    let targetValue = Self.integerValue(targetAddress)
+    let mask = prefixLength == 0 ? UInt32(0) : UInt32.max << (32 - UInt32(prefixLength))
+    return routeValue & mask == targetValue & mask
+  }
+
+  func contains(_ route: HushWireIPv4RouteSpec) -> Bool {
+    prefixLength <= route.prefixLength && contains(route.network)
+  }
+
+  private static func integerValue(_ address: IPv4Address) -> UInt32 {
+    address.rawValue.reduce(UInt32(0)) { value, byte in
+      (value << 8) | UInt32(byte)
+    }
+  }
 }
 
 struct HushWireConfigurationSummary: Equatable {
@@ -132,16 +162,29 @@ struct HushWireConfigurationSummary: Equatable {
   let mtu: UInt16
   let peerCount: Int
   let routes: [String]
+  let directRoutes: [String]
   let endpoints: [String]
+  let resolvedEndpoints: [String]
   let routePolicy: HushWireRoutePolicy
   let dnsServers: [String]
 
   var routeDescription: String {
-    routes.joined(separator: ", ")
+    guard routes.count > 6 else { return routes.joined(separator: ", ") }
+    return "共 \(routes.count) 条 · "
+      + routes.prefix(5).joined(separator: ", ")
+      + " …"
   }
 
   var endpointDescription: String {
     endpoints.joined(separator: ", ")
+  }
+
+  var directRouteDescription: String {
+    guard !directRoutes.isEmpty else { return "无" }
+    guard directRoutes.count > 6 else { return directRoutes.joined(separator: ", ") }
+    return "共 \(directRoutes.count) 条 · "
+      + directRoutes.prefix(5).joined(separator: ", ")
+      + " …"
   }
 
   var dnsDescription: String {
@@ -154,9 +197,32 @@ struct HushWireConfigurationPlan: Equatable {
   let includedRoutes: [HushWireIPv4RouteSpec]
   let excludedRoutes: [HushWireIPv4RouteSpec]
   let dnsServers: [String]
+
+  /// Routes rendered into `NEIPv4Settings`.
+  ///
+  /// Keep `0.0.0.0/0` in the semantic plan and in the HushWire core, but
+  /// express it to macOS as the equivalent pair of /1 routes. A directly
+  /// installed default route can appear in the macOS routing table while
+  /// sends through a /32-addressed packet tunnel still fail with
+  /// `EHOSTUNREACH`. The two /1 routes avoid that special default-route path
+  /// without changing configured allowed/excluded-prefix precedence.
+  var packetTunnelIncludedRoutes: [HushWireIPv4RouteSpec] {
+    includedRoutes.flatMap { route in
+      guard route.network == "0.0.0.0", route.prefixLength == 0 else {
+        return [route]
+      }
+      return [
+        HushWireIPv4RouteSpec(network: "0.0.0.0", prefixLength: 1),
+        HushWireIPv4RouteSpec(network: "128.0.0.0", prefixLength: 1),
+      ]
+    }
+  }
 }
 
 enum HushWireConfigurationPolicy {
+  static let maximumSplitRouteCount = 256
+  static let maximumExcludedRouteCount = 256
+
   static func inspect(
     _ data: Data,
     networkPolicy: HushWireNetworkPolicy = .hostRoutesOnly
@@ -181,7 +247,9 @@ enum HushWireConfigurationPolicy {
     routes: [HushWireRouteMetadata],
     networkPolicy: HushWireNetworkPolicy
   ) throws -> HushWireConfigurationPlan {
-    guard !routes.isEmpty else {
+    let tunnelRouteMetadata = routes.filter { $0.routeKind == .included }
+    let configuredExclusionMetadata = routes.filter { $0.routeKind == .excluded }
+    guard !tunnelRouteMetadata.isEmpty else {
       throw HushWireCoreError.operation("配置没有 Peer 路由。")
     }
     guard interface.listen.port == 0 else {
@@ -190,70 +258,117 @@ enum HushWireConfigurationPolicy {
     guard routes.allSatisfy({ $0.endpoint.port != 0 && !$0.endpoint.host.isEmpty }) else {
       throw HushWireCoreError.operation("Peer endpoint 无效。")
     }
+    guard configuredExclusionMetadata.count <= maximumExcludedRouteCount else {
+      throw HushWireCoreError.operation(
+        "直连例外最多接受 \(maximumExcludedRouteCount) 条 excluded_ips。"
+      )
+    }
+    let configuredExclusions = configuredExclusionMetadata.map {
+      HushWireIPv4RouteSpec(network: $0.network, prefixLength: $0.prefixLength)
+    }
 
     let includedRoutes: [HushWireIPv4RouteSpec]
     let excludedRoutes: [HushWireIPv4RouteSpec]
     switch networkPolicy.routePolicy {
     case .hostRoutesOnly:
-      guard routes.allSatisfy({ $0.prefixLength == 32 }) else {
+      guard configuredExclusions.isEmpty else {
+        throw HushWireCoreError.operation("主机路由模式不接受 excluded_ips。")
+      }
+      guard tunnelRouteMetadata.allSatisfy({ $0.prefixLength == 32 }) else {
         throw HushWireCoreError.operation(
           "主机路由模式只接受 /32，不接受子网或默认路由。"
         )
       }
-      includedRoutes = routes.map {
+      includedRoutes = tunnelRouteMetadata.map {
         HushWireIPv4RouteSpec(network: $0.network, prefixLength: $0.prefixLength)
+      }
+      let endpointHosts = Set(
+        tunnelRouteMetadata.filter { $0.endpoint.family == 4 }.map { $0.endpoint.host }
+      )
+      guard !tunnelRouteMetadata.contains(where: { endpointHosts.contains($0.network) }) else {
+        throw HushWireCoreError.operation("主机路由不能与 Peer endpoint 相同，否则会形成路由环路。")
       }
       excludedRoutes = []
 
-    case .fullTunnel:
-      guard
-        routes.count == 1,
-        routes[0].network == "0.0.0.0",
-        routes[0].prefixLength == 0
-      else {
+    case .splitRoutes:
+      guard tunnelRouteMetadata.count <= maximumSplitRouteCount else {
         throw HushWireCoreError.operation(
-          "全隧道 v1 只接受单 Peer、单条 0.0.0.0/0 路由。"
+          "自定义分流最多接受 \(maximumSplitRouteCount) 条 allowed_ips。"
         )
       }
-      let route = routes[0]
-      guard route.endpoint.family == 4, route.endpoint.host != "0.0.0.0" else {
-        throw HushWireCoreError.operation("全隧道 v1 要求有效的 IPv4 Peer endpoint。")
+      guard tunnelRouteMetadata.allSatisfy({ $0.prefixLength > 0 }) else {
+        throw HushWireCoreError.operation(
+          "自定义分流不接受 0.0.0.0/0；如需默认路由请选择默认走隧道。"
+        )
       }
-      guard route.persistentKeepalive > 0 else {
-        throw HushWireCoreError.operation("全隧道必须启用 persistent_keepalive。")
+      let route = try validateProtectedPolicy(
+        interface: interface,
+        routes: routes,
+        policyName: "自定义分流"
+      )
+      includedRoutes = tunnelRouteMetadata.map {
+        HushWireIPv4RouteSpec(network: $0.network, prefixLength: $0.prefixLength)
       }
-      switch interface.transport {
-      case .udp:
-        guard route.udpRebindAfter > route.persistentKeepalive else {
-          throw HushWireCoreError.operation(
-            "UDP 全隧道必须设置大于 persistent_keepalive 的 udp_rebind_after。"
-          )
-        }
-      case .tcp:
-        guard route.sessionTimeout > UInt64(route.persistentKeepalive) else {
-          throw HushWireCoreError.operation(
-            "TCP 全隧道必须启用大于 persistent_keepalive 的 session_timeout。"
-          )
-        }
+      excludedRoutes = try protectedExclusions(
+        configuredExclusions,
+        endpoint: route.endpoint.host,
+        coveredBy: includedRoutes
+      )
+      try validateDNS(
+        networkPolicy.dnsServers,
+        endpoint: route.endpoint.host,
+        coveredBy: includedRoutes,
+        excludedBy: excludedRoutes
+      )
+
+    case .fullTunnel:
+      guard tunnelRouteMetadata.count <= maximumSplitRouteCount else {
+        throw HushWireCoreError.operation(
+          "默认隧道最多接受 \(maximumSplitRouteCount) 条 allowed_ips。"
+        )
       }
-      guard !networkPolicy.dnsServers.contains(route.endpoint.host) else {
-        throw HushWireCoreError.operation("DNS 服务器不能与被排除的 Peer endpoint 相同。")
+      let defaultRoutes = tunnelRouteMetadata.filter {
+        $0.network == "0.0.0.0" && $0.prefixLength == 0
       }
-      includedRoutes = [HushWireIPv4RouteSpec(network: "0.0.0.0", prefixLength: 0)]
-      excludedRoutes = [
-        HushWireIPv4RouteSpec(network: route.endpoint.host, prefixLength: 32)
-      ]
+      guard defaultRoutes.count == 1 else {
+        throw HushWireCoreError.operation(
+          "默认隧道 v1 要求恰好一条 0.0.0.0/0；更具体的 allowed_ips 可覆盖较宽的 excluded_ips。"
+        )
+      }
+      let route = defaultRoutes[0]
+      _ = try validateProtectedPolicy(
+        interface: interface,
+        routes: routes,
+        policyName: "默认隧道"
+      )
+      includedRoutes = tunnelRouteMetadata.map {
+        HushWireIPv4RouteSpec(network: $0.network, prefixLength: $0.prefixLength)
+      }
+      excludedRoutes = try protectedExclusions(
+        configuredExclusions,
+        endpoint: route.endpoint.host,
+        coveredBy: includedRoutes
+      )
+      try validateDNS(
+        networkPolicy.dnsServers,
+        endpoint: route.endpoint.host,
+        coveredBy: includedRoutes,
+        excludedBy: excludedRoutes
+      )
     }
 
     let peerNames = Set(routes.map(\.peerName))
-    let endpoints = Array(Set(routes.map { $0.endpoint.displayString })).sorted()
+    let endpoints = Array(Set(routes.map(\.endpointDescription))).sorted()
+    let resolvedEndpoints = Array(Set(routes.map { $0.endpoint.displayString })).sorted()
     let summary = HushWireConfigurationSummary(
       interface: interface.cidr,
       transport: interface.transport.title,
       mtu: interface.mtu,
       peerCount: peerNames.count,
-      routes: routes.map(\.cidr),
+      routes: tunnelRouteMetadata.map(\.cidr),
+      directRoutes: excludedRoutes.map(\.cidr),
       endpoints: endpoints,
+      resolvedEndpoints: resolvedEndpoints,
       routePolicy: networkPolicy.routePolicy,
       dnsServers: networkPolicy.dnsServers
     )
@@ -263,5 +378,116 @@ enum HushWireConfigurationPolicy {
       excludedRoutes: excludedRoutes,
       dnsServers: networkPolicy.dnsServers
     )
+  }
+
+  private static func validateProtectedPolicy(
+    interface: HushWireInterfaceMetadata,
+    routes: [HushWireRouteMetadata],
+    policyName: String
+  ) throws -> HushWireRouteMetadata {
+    guard Set(routes.map(\.peerName)).count == 1 else {
+      throw HushWireCoreError.operation("\(policyName) v1 只接受单 Peer 配置。")
+    }
+    let route = routes[0]
+    guard
+      routes.allSatisfy({
+        $0.endpoint == route.endpoint
+          && $0.configuredEndpoint == route.configuredEndpoint
+      }),
+      route.endpoint.family == 4,
+      route.endpoint.host != "0.0.0.0",
+      route.endpoint.port != 0
+    else {
+      throw HushWireCoreError.operation("\(policyName) v1 要求单个有效的 IPv4 Peer endpoint。")
+    }
+    guard route.persistentKeepalive > 0 else {
+      throw HushWireCoreError.operation("\(policyName)必须启用 persistent_keepalive。")
+    }
+    switch interface.transport {
+    case .udp:
+      guard route.udpRebindAfter > route.persistentKeepalive else {
+        throw HushWireCoreError.operation(
+          "UDP \(policyName)必须设置大于 persistent_keepalive 的 udp_rebind_after。"
+        )
+      }
+    case .tcp:
+      guard route.sessionTimeout > UInt64(route.persistentKeepalive) else {
+        throw HushWireCoreError.operation(
+          "TCP \(policyName)必须启用大于 persistent_keepalive 的 session_timeout。"
+        )
+      }
+    }
+    return route
+  }
+
+  private static func validateDNS(
+    _ dnsServers: [String],
+    endpoint: String,
+    coveredBy includedRoutes: [HushWireIPv4RouteSpec],
+    excludedBy excludedRoutes: [HushWireIPv4RouteSpec]
+  ) throws {
+    guard !dnsServers.contains(endpoint) else {
+      throw HushWireCoreError.operation("DNS 服务器不能与被排除的 Peer endpoint 相同。")
+    }
+    for server in dnsServers where !includedRoutes.contains(where: { $0.contains(server) }) {
+      throw HushWireCoreError.operation(
+        "DNS 服务器 \(server) 不在 allowed_ips 内；为避免 DNS 中断，已拒绝配置。"
+      )
+    }
+    for server in dnsServers
+    where !isRoutedToTunnel(server, includedRoutes: includedRoutes, excludedRoutes: excludedRoutes)
+    {
+      throw HushWireCoreError.operation(
+        "DNS 服务器 \(server) 位于 excluded_ips 直连例外内；为避免 DNS 走错路径，已拒绝配置。"
+      )
+    }
+  }
+
+  private static func protectedExclusions(
+    _ configuredExclusions: [HushWireIPv4RouteSpec],
+    endpoint: String,
+    coveredBy includedRoutes: [HushWireIPv4RouteSpec]
+  ) throws -> [HushWireIPv4RouteSpec] {
+    for exclusion in configuredExclusions
+    where !includedRoutes.contains(where: { $0.contains(exclusion) }) {
+      throw HushWireCoreError.operation(
+        "直连例外 \(exclusion.cidr) 不在 allowed_ips 内。"
+      )
+    }
+
+    var exclusions = configuredExclusions
+    if isRoutedToTunnel(
+      endpoint,
+      includedRoutes: includedRoutes,
+      excludedRoutes: exclusions
+    ) {
+      exclusions.append(HushWireIPv4RouteSpec(network: endpoint, prefixLength: 32))
+    }
+    exclusions.sort { left, right in
+      if left.prefixLength != right.prefixLength {
+        return left.prefixLength > right.prefixLength
+      }
+      return left.network < right.network
+    }
+    return exclusions
+  }
+
+  private static func isRoutedToTunnel(
+    _ address: String,
+    includedRoutes: [HushWireIPv4RouteSpec],
+    excludedRoutes: [HushWireIPv4RouteSpec]
+  ) -> Bool {
+    guard let includedPrefixLength = includedRoutes
+      .filter({ $0.contains(address) })
+      .map(\.prefixLength)
+      .max()
+    else { return false }
+    let excludedPrefixLength = excludedRoutes
+      .filter { $0.contains(address) }
+      .map(\.prefixLength)
+      .max()
+    return excludedPrefixLength
+      .map { includedPrefixLength > $0 }
+      ?? true
   }
 }

@@ -24,7 +24,7 @@ const PACKET_INFO_SIZE: usize = 4;
 
 pub fn run(config: Config, exit_node: bool) -> anyhow::Result<()> {
     let router = Router::new(&config)?;
-    let engine = Engine::new(&config)?;
+    let engine = Engine::with_router(&config, router.clone())?;
     let mut engine_scheduler = EngineScheduler::new(&config);
 
     // Create the TUN interface before installing routes or firewall rules,

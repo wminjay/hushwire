@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import Foundation
 @preconcurrency import NetworkExtension
 import SystemExtensions
@@ -64,6 +65,10 @@ final class SystemExtensionController: NSObject, ObservableObject {
   private var statusObserver: NSObjectProtocol?
   private var providerPollTimer: DispatchSourceTimer?
   private var configurationDeliveryInFlight = false
+  private var configurationDeliveryLeadership: FileHandle?
+  private var awaitingExternalConfigurationConfirmation = false
+  private var stopRequestedByThisController = false
+  private var providerStatusEpoch: UInt64 = 0
   private var propertiesRequest: OSSystemExtensionRequest?
 
   override init() {
@@ -75,9 +80,26 @@ final class SystemExtensionController: NSObject, ObservableObject {
     ) { [weak self] _ in
       Task { @MainActor in
         guard let self, let manager = self.manager else { return }
-        self.vpnStatus = manager.connection.status
+        let status = manager.connection.status
+        let wasProviderReady = self.providerReady
+        let wasAwaitingExternalConfirmation = self.awaitingExternalConfigurationConfirmation
+        if status != self.vpnStatus, status != .connected {
+          self.providerStatusEpoch &+= 1
+        }
+        self.vpnStatus = status
         if self.vpnStatus == .connected {
           self.deliverConfigurationIfNeeded()
+        } else if self.vpnStatus == .disconnected || self.vpnStatus == .invalid {
+          self.releaseConfigurationDeliveryLeadership()
+          self.awaitingExternalConfigurationConfirmation = false
+          if self.stopRequestedByThisController {
+            self.activity = "Packet Tunnel 已断开；系统路由与 DNS 已恢复。"
+          } else if wasProviderReady {
+            self.activity = "检测到 Packet Tunnel 已断开；系统路由与 DNS 已恢复。"
+          } else if wasAwaitingExternalConfirmation {
+            self.activity = "Packet Tunnel 已断开；当前窗口未收到最终配置确认，系统网络未被继续接管。"
+          }
+          self.stopRequestedByThisController = false
         }
         self.refreshProviderStatus()
       }
@@ -122,6 +144,10 @@ final class SystemExtensionController: NSObject, ObservableObject {
     selectedRoutePolicy == .fullTunnel
   }
 
+  var canConfigureDNS: Bool {
+    selectedRoutePolicy.allowsDNS
+  }
+
   func selectRoutePolicy(_ routePolicy: HushWireRoutePolicy) {
     guard canEditNetworkPolicy else {
       activity = "请先断开当前隧道，再修改网络策略。"
@@ -133,10 +159,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
     }
     refreshStagedConfiguration(reportFailure: true)
     if configurationSummary == nil {
-      activity =
-        routePolicy == .fullTunnel
-        ? "已选择全隧道；请导入单 Peer、单条 0.0.0.0/0 的配置。"
-        : "已选择 /32 主机路由；请导入只包含 /32 allowed_ips 的配置。"
+      switch routePolicy {
+      case .hostRoutesOnly:
+        activity = "已选择 /32 主机路由；请导入只包含 /32 allowed_ips 的配置。"
+      case .splitRoutes:
+        activity = "已选择自定义分流；请导入单 Peer、最多 256 条非默认 IPv4 CIDR。"
+      case .fullTunnel:
+        activity = "已选择默认走隧道；请使用单 Peer、0.0.0.0/0，可用 excluded_ips 添加直连例外。"
+      }
     }
   }
 
@@ -222,6 +252,10 @@ final class SystemExtensionController: NSObject, ObservableObject {
       }
       providerReady = false
       configurationDeliveryInFlight = false
+      awaitingExternalConfigurationConfirmation = false
+      stopRequestedByThisController = false
+      releaseConfigurationDeliveryLeadership()
+      providerStatusEpoch &+= 1
       let startOptions: [String: NSObject]? =
         selectedPolicy.routePolicy == .fullTunnel
         ? [HushWireNetworkPolicy.fullTunnelApprovalOptionKey: NSNumber(value: true)]
@@ -239,6 +273,9 @@ final class SystemExtensionController: NSObject, ObservableObject {
     manager.connection.stopVPNTunnel()
     providerReady = false
     configurationDeliveryInFlight = false
+    awaitingExternalConfigurationConfirmation = false
+    stopRequestedByThisController = true
+    providerStatusEpoch &+= 1
     vpnStatus = manager.connection.status
     activity = "已请求 macOS 停止 Packet Tunnel；停止不再调用管理员提权脚本。"
   }
@@ -277,14 +314,18 @@ final class SystemExtensionController: NSObject, ObservableObject {
         lastHandshake = ""
         providerReady = false
         configurationDeliveryInFlight = false
+        awaitingExternalConfigurationConfirmation = false
+        releaseConfigurationDeliveryLeadership()
       }
       return
     }
+    let statusEpoch = providerStatusEpoch
     do {
       try session.sendProviderMessage(Data([0x01])) { [weak self] response in
         guard let response else { return }
         Task { @MainActor in
-          self?.applyProviderStatus(response)
+          guard let self, self.providerStatusEpoch == statusEpoch else { return }
+          self.applyProviderStatus(response)
         }
       }
     } catch {
@@ -299,6 +340,8 @@ final class SystemExtensionController: NSObject, ObservableObject {
     let running = (object["running"] as? NSNumber)?.boolValue ?? false
     let awaitingConfiguration =
       (object["awaitingConfiguration"] as? NSNumber)?.boolValue ?? false
+    let recoveredFromAnotherWindow = running && awaitingExternalConfigurationConfirmation
+    let becameReady = running && !providerReady
     providerReady = running
     lastHandshake = object["lastHandshake"] as? String ?? ""
     let peerObjects = object["peers"] as? [[String: Any]] ?? []
@@ -311,6 +354,12 @@ final class SystemExtensionController: NSObject, ObservableObject {
         lastSeenMillisecondsAgo: peer["lastSeenMillisecondsAgo"].map(Self.uint64),
         endpoint: peer["endpoint"] as? String
       )
+    }
+    if recoveredFromAnotherWindow {
+      awaitingExternalConfigurationConfirmation = false
+      updateReadyActivity(prefix: "检测到隧道已由另一个 HushWire 窗口完成配置。")
+    } else if becameReady {
+      updateReadyActivity()
     }
     if awaitingConfiguration && !running {
       deliverConfigurationIfNeeded()
@@ -327,6 +376,11 @@ final class SystemExtensionController: NSObject, ObservableObject {
     else { return }
 
     do {
+      guard try acquireConfigurationDeliveryLeadership() else {
+        awaitingExternalConfigurationConfirmation = true
+        activity = "另一个 HushWire 窗口正在安装隧道配置；当前窗口等待扩展确认。"
+        return
+      }
       let configuration = try HushWireConfigurationStore.load()
       var message = Data([0x02])
       message.append(configuration)
@@ -346,28 +400,102 @@ final class SystemExtensionController: NSObject, ObservableObject {
                 (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"]
                   as? String
               } ?? "扩展没有返回成功响应。"
-            self.activity = "安装隧道配置失败：\(detail)"
             self.providerReady = false
-            manager.connection.stopVPNTunnel()
+            self.awaitingExternalConfigurationConfirmation = response == nil
+            self.providerStatusEpoch &+= 1
+            self.releaseConfigurationDeliveryLeadership()
+            if response == nil {
+              self.activity = "扩展配置响应未返回；正在确认是否已由另一个 HushWire 窗口完成配置。"
+            } else {
+              self.activity = "安装隧道配置失败：\(detail)。扩展将自行安全停止，当前窗口不会断开共享会话。"
+            }
+            self.refreshProviderStatus()
             return
           }
+          // Any status request issued before this acknowledgement describes
+          // the pre-configuration provider state. Invalidate those callbacks
+          // before marking the provider ready so a late `awaitingConfiguration`
+          // response cannot trigger a duplicate install and stop the tunnel.
+          self.providerStatusEpoch &+= 1
           self.providerReady = true
-          if let summary = self.configurationSummary {
-            self.activity =
-              summary.routePolicy == .fullTunnel
-              ? "全隧道已就绪：endpoint 已直连排除；DNS：\(summary.dnsDescription)。"
-              : "隧道已就绪：仅启用 /32 路由，默认路由与 DNS 未修改。"
-          } else {
-            self.activity = "隧道已就绪。"
-          }
+          self.awaitingExternalConfigurationConfirmation = false
+          self.updateReadyActivity()
           self.refreshProviderStatus()
         }
       }
     } catch {
       configurationDeliveryInFlight = false
-      activity = "传递隧道配置失败：\(error.localizedDescription)"
-      manager.connection.stopVPNTunnel()
+      providerReady = false
+      awaitingExternalConfigurationConfirmation = true
+      releaseConfigurationDeliveryLeadership()
+      activity = "传递隧道配置失败：\(error.localizedDescription)。正在确认扩展状态，不主动断开共享会话。"
+      providerStatusEpoch &+= 1
+      refreshProviderStatus()
     }
+  }
+
+  private func updateReadyActivity(prefix: String? = nil) {
+    let detail: String
+    if let summary = configurationSummary {
+      switch summary.routePolicy {
+      case .hostRoutesOnly:
+        detail = "隧道已就绪：仅启用 /32 路由，默认路由与 DNS 未修改。"
+      case .splitRoutes:
+        detail = "自定义分流已就绪：\(summary.routes.count) 条路由；DNS：\(summary.dnsDescription)。"
+      case .fullTunnel:
+        detail =
+          "默认隧道已就绪：\(summary.directRoutes.count) 条直连例外；DNS：\(summary.dnsDescription)。"
+      }
+    } else {
+      detail = "隧道已就绪。"
+    }
+    activity = [prefix, detail].compactMap { $0 }.joined(separator: " ")
+  }
+
+  private func acquireConfigurationDeliveryLeadership() throws -> Bool {
+    if configurationDeliveryLeadership != nil {
+      return true
+    }
+    guard
+      let containerURL = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: HushWireConfigurationStore.appGroupIdentifier
+      )
+    else {
+      throw HushWireCoreError.operation("无法访问 HushWire App Group 配置容器。")
+    }
+    let lockURL = containerURL.appendingPathComponent(
+      "configuration-delivery.lock",
+      isDirectory: false
+    )
+    let descriptor = lockURL.path.withCString { path in
+      Darwin.open(
+        path,
+        O_CREAT | O_RDWR | O_EXLOCK | O_NONBLOCK,
+        S_IRUSR | S_IWUSR
+      )
+    }
+    guard descriptor >= 0 else {
+      if errno == EWOULDBLOCK || errno == EAGAIN {
+        return false
+      }
+      throw NSError(
+        domain: NSPOSIXErrorDomain,
+        code: Int(errno),
+        userInfo: [NSLocalizedDescriptionKey: "无法获取隧道配置投递锁。"]
+      )
+    }
+    _ = Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR)
+    configurationDeliveryLeadership = FileHandle(
+      fileDescriptor: descriptor,
+      closeOnDealloc: true
+    )
+    return true
+  }
+
+  private func releaseConfigurationDeliveryLeadership() {
+    guard let handle = configurationDeliveryLeadership else { return }
+    try? handle.close()
+    configurationDeliveryLeadership = nil
   }
 
   private static func uint64(_ value: Any?) -> UInt64 {
@@ -438,10 +566,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
     let tunnelProtocol = NETunnelProviderProtocol()
     tunnelProtocol.providerBundleIdentifier = SystemExtensionConstants.extensionBundleIdentifier
     tunnelProtocol.serverAddress =
-      configurationSummary?.endpoints.first
+      configurationSummary?.resolvedEndpoints.first
       ?? SystemExtensionConstants.serverAddress
+    // Make included/excluded route intent deterministic even when the current
+    // LAN has an overlapping route. The endpoint and explicit direct routes
+    // are scoped to the physical interface by Network Extension.
+    tunnelProtocol.enforceRoutes = true
     tunnelProtocol.providerConfiguration = networkPolicy.addingProviderConfiguration(to: [
-      "schemaVersion": 3,
+      "schemaVersion": 4,
       "configurationStorage": HushWireConfigurationStore.providerStorageKind,
     ])
     manager.localizedDescription = SystemExtensionConstants.profileDescription
@@ -459,10 +591,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
         self.manager = manager
         self.isBusy = false
         self.vpnStatus = manager?.connection.status ?? .invalid
-        self.activity =
-          networkPolicy.routePolicy == .fullTunnel
-          ? "VPN 配置已保存为全隧道；连接前仍会再次确认网络影响。"
-          : "VPN 配置已保存为 /32 主机路由；默认路由与 DNS 不会修改。"
+        switch networkPolicy.routePolicy {
+        case .hostRoutesOnly:
+          self.activity = "VPN 配置已保存为 /32 主机路由；默认路由与 DNS 不会修改。"
+        case .splitRoutes:
+          self.activity = "VPN 配置已保存为自定义分流；连接前会先完成认证预握手。"
+        case .fullTunnel:
+          self.activity = "VPN 配置已保存为默认走隧道；连接前仍会再次确认网络影响。"
+        }
       }
     }
   }

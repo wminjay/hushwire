@@ -17,6 +17,21 @@ HushWire is an experimental WireGuard-like IPv4 L3 tunnel focused on observabili
 
 Each archive has a matching `.sha256` checksum. The GUI app is ad-hoc signed and not notarized; it is intended for personal testing.
 
+## v0.7.0-rc.3: macOS policy routing and lifecycle hardening
+
+This release candidate is wire-compatible with v0.6.x and the earlier v0.7.0 candidates. It extends local routing and macOS Packet Tunnel behavior without changing the wire protocol.
+
+- Peer endpoints may use DNS names. They resolve once per runtime and refresh on reconnect while the configured DNS name remains visible.
+- Optional `excluded_ips` express direct-route exceptions beneath broad `allowed_ips`, including a compact "everything except these networks" policy instead of hundreds of complement CIDRs.
+- The macOS System Extension preview now supports `/32` isolation, custom split routing, and explicitly confirmed IPv4 full tunnel with DNS. A default route is rendered as `0.0.0.0/1` plus `128.0.0.0/1` for reliable Network Extension routing while preserving `0.0.0.0/0` policy semantics.
+- The GUI shows effective included and excluded routes and accepts the same single-peer TOML used by the CLI without exposing keys.
+- Multiple HushWire windows coordinate private provider-message delivery through an App Group lock. A stale or duplicate window can no longer tear down the shared system VPN session when its own IPC response is missing.
+- Identical duplicate configuration delivery is idempotent inside the provider, and the provider now owns bounded startup failure: if safe configuration or authenticated preflight never completes, it stops itself without installing protected routes or DNS.
+
+Validation includes 110 Rust tests, Clippy with warnings denied, the universal XCFramework and Swift bridge smoke tests, and a development-signed macOS build. An isolated macOS VM verified the exact include/exclude route matrix, DNS, endpoint bypass, UDP full-tunnel exit, TLS 1.3, repeated connect/disconnect cleanup, and a deliberate two-process GUI race. The race produced exactly one configuration install, no unintended stop command, and remained healthy beyond both startup timeout windows; explicit disconnect restored the physical route and original public exit.
+
+This candidate remains a draft. Developer ID notarization, clean physical-Mac installation, sleep/wake and interface-switch testing, and a 24-hour soak remain gates for stable v0.7.0.
+
 ## v0.7.0-rc.2: simultaneous-rekey liveness hotfix
 
 This release candidate fixes a liveness regression introduced in v0.7.0-rc.1. When both ends started the scheduled rekey at nearly the same time, a passive endpoint could override the shared handshake-identifier tie-break while the active endpoint still followed it. Some identifier orderings therefore left both endpoints waiting as responders until the stale handshake candidates expired, causing a roughly two-minute traffic interruption.
@@ -94,7 +109,7 @@ Do not merge a v0.6 peer into an old production instance until every endpoint at
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
-./hushwire --version       # hushwire 0.7.0-rc.2
+./hushwire --version       # hushwire 0.7.0-rc.3
 ./hushwire genkey
 openssl rand -base64 32
 sudo ./hushwire up -c my-node.toml

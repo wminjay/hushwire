@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define HW_CORE_ABI_VERSION 1u
+#define HW_CORE_ABI_VERSION 2u
 #define HW_ERROR_MESSAGE_CAPACITY 512u
 
 typedef int32_t HWStatus;
@@ -47,7 +47,8 @@ typedef struct {
 typedef struct {
   uint8_t network[4];
   uint8_t prefix_length;
-  uint8_t reserved[3];
+  uint8_t route_kind; /* 1 for included, 2 for direct-route exclusion. */
+  uint8_t reserved[2];
   HWEndpoint endpoint;
   uint16_t persistent_keepalive;
   uint16_t udp_rebind_after;
@@ -102,6 +103,8 @@ typedef void (*HWRouteCallback)(
     void *context,
     const uint8_t *peer_name,
     size_t peer_name_length,
+    const uint8_t *configured_endpoint,
+    size_t configured_endpoint_length,
     const HWRouteConfig *route);
 
 typedef void (*HWPeerStatsCallback)(

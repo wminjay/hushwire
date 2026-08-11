@@ -28,6 +28,11 @@ enum HushWireTransportKind: UInt8, Sendable {
   }
 }
 
+enum HushWireRouteKind: UInt8, Sendable {
+  case included = 1
+  case excluded = 2
+}
+
 struct HushWireEndpoint: Hashable, Sendable {
   let family: UInt8
   let addressBytes: [UInt8]
@@ -75,6 +80,8 @@ struct HushWireRouteMetadata: Sendable {
   let peerName: String
   let networkBytes: [UInt8]
   let prefixLength: UInt8
+  let routeKind: HushWireRouteKind
+  let configuredEndpoint: String
   let endpoint: HushWireEndpoint
   let persistentKeepalive: UInt16
   let udpRebindAfter: UInt16
@@ -85,6 +92,12 @@ struct HushWireRouteMetadata: Sendable {
   }
 
   var cidr: String { "\(network)/\(prefixLength)" }
+
+  var endpointDescription: String {
+    configuredEndpoint == endpoint.displayString
+      ? endpoint.displayString
+      : "\(configuredEndpoint) → \(endpoint.displayString)"
+  }
 }
 
 struct HushWirePeerStatistics: Sendable {
@@ -272,6 +285,9 @@ final class HushWireCoreRuntime {
       &error
     )
     try Self.check(status, error: &error, operation: "读取路由配置")
+    if let invalidRouteKind = collector.invalidRouteKind {
+      throw HushWireCoreError.operation("Core 返回未知路由类型 \(invalidRouteKind)。")
+    }
     return collector.routes
   }
 
@@ -339,6 +355,7 @@ final class HushWireCoreRuntime {
 
 private final class HushWireRouteCollector {
   var routes: [HushWireRouteMetadata] = []
+  var invalidRouteKind: UInt8?
 }
 
 private final class HushWireStatsCollector {
@@ -423,16 +440,27 @@ private func hushWireVisitRoute(
   _ context: UnsafeMutableRawPointer?,
   _ peerName: UnsafePointer<UInt8>?,
   _ peerNameLength: Int,
+  _ configuredEndpoint: UnsafePointer<UInt8>?,
+  _ configuredEndpointLength: Int,
   _ route: UnsafePointer<HWRouteConfig>?
 ) {
   guard let context, let route else { return }
   let collector = Unmanaged<HushWireRouteCollector>.fromOpaque(context).takeUnretainedValue()
   let value = route.pointee
+  guard let routeKind = HushWireRouteKind(rawValue: value.route_kind) else {
+    collector.invalidRouteKind = value.route_kind
+    return
+  }
   collector.routes.append(
     HushWireRouteMetadata(
       peerName: copiedString(peerName, length: peerNameLength),
       networkBytes: withUnsafeBytes(of: value.network) { Array($0) },
       prefixLength: value.prefix_length,
+      routeKind: routeKind,
+      configuredEndpoint: copiedString(
+        configuredEndpoint,
+        length: configuredEndpointLength
+      ),
       endpoint: HushWireEndpoint(value.endpoint),
       persistentKeepalive: value.persistent_keepalive,
       udpRebindAfter: value.udp_rebind_after,

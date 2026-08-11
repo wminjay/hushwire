@@ -15,7 +15,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     }
   }
 
-  private struct PendingFullTunnelActivation {
+  private struct PendingProtectedActivation {
     let settings: NEPacketTunnelNetworkSettings
     let plan: HushWireConfigurationPlan
     let completionHandler: ((Data?) -> Void)?
@@ -26,13 +26,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
   private var core: HushWireCoreRuntime?
   private var transport: HushWireNetworkTransport?
   private var maintenanceTimer: DispatchSourceTimer?
-  private var fullTunnelHandshakeTimeout: DispatchWorkItem?
-  private var pendingFullTunnelActivation: PendingFullTunnelActivation?
+  private var configurationDeliveryTimeout: DispatchWorkItem?
+  private var protectedHandshakeTimeout: DispatchWorkItem?
+  private var pendingProtectedActivation: PendingProtectedActivation?
   private var peerNames: [String] = []
   private var interfaceMetadata: HushWireInterfaceMetadata?
   private var routeMetadata: [HushWireRouteMetadata] = []
   private var networkPolicy = HushWireNetworkPolicy.hostRoutesOnly
   private var lastHandshakeDescription: String?
+  private var activeConfiguration: Data?
+  private var duplicateConfigurationCompletionHandlers: [((Data?) -> Void)] = []
   private var awaitingConfiguration = false
   private var running = false
 
@@ -62,14 +65,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
         let schemaVersion =
           (providerConfiguration["schemaVersion"] as? NSNumber)?.intValue
           ?? providerConfiguration["schemaVersion"] as? Int
-        guard schemaVersion == 2 || schemaVersion == 3 else {
+        guard let schemaVersion, schemaVersion == 2 || schemaVersion == 3 || schemaVersion == 4 else {
           throw ProviderFailure.error(code: 3, description: "VPN 配置 schemaVersion 不受支持。")
         }
         if networkPolicy.routePolicy == .fullTunnel {
-          guard schemaVersion == 3 else {
+          guard schemaVersion >= 3 else {
             throw ProviderFailure.error(
               code: 3,
-              description: "全隧道要求 schemaVersion 3，请重新保存 VPN 配置。"
+              description: "默认隧道要求 schemaVersion 3 或更高版本，请重新保存 VPN 配置。"
             )
           }
           guard
@@ -78,9 +81,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
           else {
             throw ProviderFailure.error(
               code: 3,
-              description: "全隧道启动缺少本次明确确认；请从 HushWire App 点击连接。"
+              description: "默认隧道启动缺少本次明确确认；请从 HushWire App 点击连接。"
             )
           }
+        }
+        if networkPolicy.routePolicy == .splitRoutes, schemaVersion != 4 {
+          throw ProviderFailure.error(
+            code: 3,
+            description: "自定义分流要求 schemaVersion 4，请重新保存 VPN 配置。"
+          )
         }
         // Secrets are intentionally not accepted in start options because
         // macOS retains those options in diagnostic session state. Mark the
@@ -88,6 +97,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
         // over the private provider-message channel.
         self.networkPolicy = networkPolicy
         awaitingConfiguration = true
+        scheduleConfigurationDeliveryTimeout()
         logger.info(
           "Packet Tunnel is waiting for private configuration delivery; routePolicy=\(networkPolicy.routePolicy.rawValue, privacy: .public)"
         )
@@ -186,7 +196,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     workQueue.async { [weak self] in
       guard let self, runtime === self.core else { return }
       self.lastHandshakeDescription = "\(peerName) · \(roleName) · \(endpoint.displayString)"
-      self.activatePendingFullTunnelIfNeeded(peerName: peerName)
+      self.activatePendingProtectedConfigurationIfNeeded(peerName: peerName)
     }
   }
 
@@ -217,12 +227,30 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     completionHandler: ((Data?) -> Void)?
   ) {
     do {
+      if let activeConfiguration {
+        guard activeConfiguration == configuration else {
+          completionHandler?(
+            response(ok: false, error: "隧道已使用另一份配置运行；请先断开再切换配置。")
+          )
+          return
+        }
+        if running {
+          logger.info("Ignoring an identical duplicate configuration delivery")
+          completionHandler?(response(ok: true))
+        } else if let completionHandler {
+          logger.info("Coalescing an identical configuration delivery during startup")
+          duplicateConfigurationCompletionHandlers.append(completionHandler)
+        }
+        return
+      }
       guard awaitingConfiguration, !running, core == nil else {
         throw ProviderFailure.error(code: 9, description: "隧道配置已经安装。")
       }
       guard !configuration.isEmpty, configuration.count <= 1_048_576 else {
         throw ProviderFailure.error(code: 10, description: "临时配置为空或超过 1 MiB。")
       }
+      configurationDeliveryTimeout?.cancel()
+      configurationDeliveryTimeout = nil
 
       let runtime = try HushWireCoreRuntime(configuration: configuration)
       let interface = try runtime.interfaceMetadata()
@@ -245,6 +273,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       runtime.delegate = self
       try runtime.start()
 
+      activeConfiguration = configuration
       core = runtime
       transport = networkTransport
       interfaceMetadata = interface
@@ -256,16 +285,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
         routes: routes,
         plan: configurationPlan
       )
-      if networkPolicy.routePolicy == .fullTunnel {
-        pendingFullTunnelActivation = PendingFullTunnelActivation(
+      if networkPolicy.routePolicy.requiresAuthenticatedPreflight {
+        pendingProtectedActivation = PendingProtectedActivation(
           settings: settings,
           plan: configurationPlan,
           completionHandler: completionHandler
         )
         startMaintenanceTimer()
-        scheduleFullTunnelHandshakeTimeout()
+        scheduleProtectedHandshakeTimeout()
         logger.info(
-          "Full tunnel is waiting for an authenticated preflight handshake before routes or DNS are installed"
+          "Protected network policy is waiting for an authenticated preflight handshake before routes or DNS are installed; routePolicy=\(self.networkPolicy.routePolicy.rawValue, privacy: .public)"
         )
         startInitialHandshakes()
       } else {
@@ -281,16 +310,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     }
   }
 
-  private func activatePendingFullTunnelIfNeeded(peerName: String) {
+  private func activatePendingProtectedConfigurationIfNeeded(peerName: String) {
     guard
       peerNames.contains(peerName),
-      let pending = pendingFullTunnelActivation
+      let pending = pendingProtectedActivation
     else { return }
-    pendingFullTunnelActivation = nil
-    fullTunnelHandshakeTimeout?.cancel()
-    fullTunnelHandshakeTimeout = nil
+    pendingProtectedActivation = nil
+    protectedHandshakeTimeout?.cancel()
+    protectedHandshakeTimeout = nil
     logger.info(
-      "Authenticated preflight completed for \(peerName, privacy: .public); installing full-tunnel routes and DNS"
+      "Authenticated preflight completed for \(peerName, privacy: .public); installing routes and DNS for \(self.networkPolicy.routePolicy.rawValue, privacy: .public)"
     )
     activateConfiguration(
       settings: pending.settings,
@@ -323,24 +352,49 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
         self.logger.info(
           "Packet Tunnel configured; routePolicy=\(self.networkPolicy.routePolicy.rawValue, privacy: .public) includedRoutes=\(plan.includedRoutes.count) excludedRoutes=\(plan.excludedRoutes.count) dnsServers=\(plan.dnsServers.count)"
         )
-        completionHandler?(self.response(ok: true))
+        let successResponse = self.response(ok: true)
+        completionHandler?(successResponse)
+        let duplicateCompletions = self.duplicateConfigurationCompletionHandlers
+        self.duplicateConfigurationCompletionHandlers = []
+        for duplicateCompletion in duplicateCompletions {
+          duplicateCompletion(successResponse)
+        }
       }
     }
   }
 
-  private func scheduleFullTunnelHandshakeTimeout() {
-    fullTunnelHandshakeTimeout?.cancel()
+  private func scheduleProtectedHandshakeTimeout() {
+    protectedHandshakeTimeout?.cancel()
     let timeout = DispatchWorkItem { [weak self] in
-      guard let self, let pending = self.pendingFullTunnelActivation else { return }
-      self.pendingFullTunnelActivation = nil
-      self.fullTunnelHandshakeTimeout = nil
+      guard let self, let pending = self.pendingProtectedActivation else { return }
+      self.pendingProtectedActivation = nil
+      self.protectedHandshakeTimeout = nil
       let error = ProviderFailure.error(
         code: 11,
-        description: "全隧道预握手在 15 秒内未完成；默认路由和 DNS 均未修改。"
+        description: "认证预握手在 15 秒内未完成；隧道路由和 DNS 均未修改。"
       )
       self.finishFailedConfiguration(error, completionHandler: pending.completionHandler)
     }
-    fullTunnelHandshakeTimeout = timeout
+    protectedHandshakeTimeout = timeout
+    workQueue.asyncAfter(deadline: .now() + 15, execute: timeout)
+  }
+
+  private func scheduleConfigurationDeliveryTimeout() {
+    configurationDeliveryTimeout?.cancel()
+    let timeout = DispatchWorkItem { [weak self] in
+      guard
+        let self,
+        self.awaitingConfiguration,
+        self.activeConfiguration == nil
+      else { return }
+      self.configurationDeliveryTimeout = nil
+      let error = ProviderFailure.error(
+        code: 12,
+        description: "15 秒内未收到安全隧道配置；Packet Tunnel 已自动停止。"
+      )
+      self.finishFailedConfiguration(error, completionHandler: nil)
+    }
+    configurationDeliveryTimeout = timeout
     workQueue.asyncAfter(deadline: .now() + 15, execute: timeout)
   }
 
@@ -371,7 +425,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       "dnsServers": networkPolicy.dnsServers,
       "interface": interfaceMetadata?.cidr ?? "",
       "transport": interfaceMetadata?.transport.title ?? "",
-      "routes": routeMetadata.map(\.cidr),
+      "routes": routeMetadata.filter { $0.routeKind == .included }.map(\.cidr),
+      "excludedRoutes": routeMetadata.filter { $0.routeKind == .excluded }.map(\.cidr),
       "lastHandshake": lastHandshakeDescription ?? "",
       "peers": peers,
     ]
@@ -389,8 +444,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     routes: [HushWireRouteMetadata],
     plan: HushWireConfigurationPlan
   ) -> NEPacketTunnelNetworkSettings {
+    let tunnelEndpoint = routes.first { $0.routeKind == .included }?.endpoint.host
+      ?? routes[0].endpoint.host
     let settings = NEPacketTunnelNetworkSettings(
-      tunnelRemoteAddress: routes[0].endpoint.host
+      tunnelRemoteAddress: tunnelEndpoint
     )
     // Always use a /32 interface mask. This avoids macOS implicitly adding the
     // wider interface-address subnet as a connected route.
@@ -398,12 +455,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       addresses: [interface.address],
       subnetMasks: ["255.255.255.255"]
     )
-    ipv4.includedRoutes = plan.includedRoutes.map {
+    ipv4.includedRoutes = plan.packetTunnelIncludedRoutes.map {
       NEIPv4Route(destinationAddress: $0.network, subnetMask: $0.subnetMask)
     }
-    // A full tunnel must keep every transport endpoint on the primary
-    // physical interface or its encrypted transport would recursively enter
-    // the tunnel itself. The v1 policy currently permits exactly one endpoint.
+    // Direct-route exclusions include configured excluded_ips and any
+    // automatically protected endpoint whose address an included route would
+    // otherwise capture.
     ipv4.excludedRoutes = plan.excludedRoutes.map {
       NEIPv4Route(destinationAddress: $0.network, subnetMask: $0.subnetMask)
     }
@@ -465,7 +522,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     timer.setEventHandler { [weak self] in
       guard
         let self,
-        self.running || self.pendingFullTunnelActivation != nil,
+        self.running || self.pendingProtectedActivation != nil,
         let core = self.core
       else { return }
       do {
@@ -494,13 +551,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     logger.error("Packet Tunnel configuration failed: \(error.localizedDescription)")
     tearDownRuntime()
     completionHandler?(response(ok: false, error: error.localizedDescription))
+    cancelTunnelWithError(error)
   }
 
   private func tearDownRuntime() {
-    fullTunnelHandshakeTimeout?.cancel()
-    fullTunnelHandshakeTimeout = nil
-    let pendingCompletion = pendingFullTunnelActivation?.completionHandler
-    pendingFullTunnelActivation = nil
+    configurationDeliveryTimeout?.cancel()
+    configurationDeliveryTimeout = nil
+    protectedHandshakeTimeout?.cancel()
+    protectedHandshakeTimeout = nil
+    let pendingCompletion = pendingProtectedActivation?.completionHandler
+    pendingProtectedActivation = nil
     awaitingConfiguration = false
     running = false
     maintenanceTimer?.setEventHandler {}
@@ -520,6 +580,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     routeMetadata = []
     networkPolicy = .hostRoutesOnly
     lastHandshakeDescription = nil
-    pendingCompletion?(response(ok: false, error: "隧道在全隧道预握手期间停止。"))
+    activeConfiguration = nil
+    let stoppedResponse = response(ok: false, error: "隧道在认证预握手期间停止。")
+    pendingCompletion?(stoppedResponse)
+    let duplicateCompletions = duplicateConfigurationCompletionHandlers
+    duplicateConfigurationCompletionHandlers = []
+    for duplicateCompletion in duplicateCompletions {
+      duplicateCompletion(stoppedResponse)
+    }
   }
 }

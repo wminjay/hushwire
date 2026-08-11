@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::process::Command;
 #[cfg(target_os = "linux")]
@@ -11,6 +12,7 @@ use tracing::{info, warn};
 pub enum RouteKind {
     Tun,
     EndpointException,
+    ExcludedPrefix,
 }
 
 #[derive(Clone, Debug)]
@@ -41,11 +43,34 @@ impl RouteManager {
 
     /// Install routes based on the router configuration.
     pub fn setup(&mut self, router: &Router) -> anyhow::Result<()> {
+        let result = self.setup_inner(router);
+        if result.is_err() {
+            cleanup_routes(&self.installed);
+            self.installed.clear();
+        }
+        result
+    }
+
+    fn setup_inner(&mut self, router: &Router) -> anyhow::Result<()> {
+        // Resolve and pin every captured transport endpoint before installing
+        // any tunnel route. This protects both a /0 full tunnel and large
+        // split-route sets from recursively routing their own encrypted flow.
+        let mut installed_exclusions = HashSet::new();
+        for route in router.excluded_routes() {
+            if installed_exclusions.insert(route.prefix) {
+                info!(peer = %route.peer.name, prefix = %route.prefix, "installing configured direct-route exclusion");
+                self.add_prefix_exception(&route.prefix)?;
+            }
+        }
+        for peer in router.endpoint_exception_peers() {
+            info!(peer = %peer.name, endpoint = %peer.endpoint, "installing endpoint exception");
+            self.add_endpoint_exception(&peer.endpoint.ip())?;
+        }
+
         for route in router.routes() {
             if route.prefix.prefix_len() == 0 {
                 // Full-tunnel: split default route to avoid replacing it directly.
                 info!(peer = %route.peer.name, endpoint = %route.peer.endpoint, "installing full-tunnel routes");
-                self.add_endpoint_exception(&route.peer.endpoint.ip())?;
                 self.add_tun_route("0.0.0.0/1")?;
                 self.add_tun_route("128.0.0.0/1")?;
             } else if route.prefix.prefix_len() == 32 {
@@ -80,18 +105,18 @@ impl RouteManager {
         match get_route_info(&host) {
             Ok((Some(gateway), dev)) => {
                 info!(host = %host, gateway = %gateway, dev = %dev, "adding endpoint exception route");
-                if let Err(e) = add_host_route_via(&host, &gateway, &dev) {
-                    warn!(host = %host, error = %e, "failed to add endpoint exception route via gateway");
-                }
+                add_host_route_via(&host, &gateway, &dev)
+                    .with_context(|| format!("add endpoint exception for {host} via {gateway}"))?;
             }
             Ok((None, dev)) => {
                 info!(host = %host, dev = %dev, "adding endpoint exception route (no gateway)");
-                if let Err(e) = add_host_route_dev(&host, &dev) {
-                    warn!(host = %host, error = %e, "failed to add endpoint exception route via dev");
-                }
+                add_host_route_dev(&host, &dev)
+                    .with_context(|| format!("add endpoint exception for {host} on {dev}"))?;
             }
             Err(e) => {
-                warn!(host = %host, error = %e, "could not determine gateway for endpoint; manual route may be required");
+                return Err(e).with_context(|| {
+                    format!("determine physical route before excluding endpoint {host}")
+                });
             }
         }
         self.installed.push(InstalledRoute {
@@ -101,15 +126,42 @@ impl RouteManager {
         });
         Ok(())
     }
+
+    fn add_prefix_exception(&mut self, prefix: &ipnet::Ipv4Net) -> anyhow::Result<()> {
+        let spec = prefix.to_string();
+        let probe = if prefix.prefix_len() == 32 {
+            prefix.network()
+        } else {
+            std::net::Ipv4Addr::from(u32::from(prefix.network()).saturating_add(1))
+        };
+        let (gateway, dev) = get_route_info(&probe.to_string())
+            .with_context(|| format!("determine physical route before excluding {spec}"))?;
+        if let Some(gateway) = gateway {
+            info!(prefix = %spec, gateway = %gateway, dev = %dev, "adding configured direct-route exclusion");
+            add_prefix_route_via(&spec, &gateway, &dev)
+                .with_context(|| format!("add direct-route exclusion {spec} via {gateway}"))?;
+        } else {
+            info!(prefix = %spec, dev = %dev, "adding configured direct-route exclusion without gateway");
+            add_prefix_route_dev(&spec, &dev)
+                .with_context(|| format!("add direct-route exclusion {spec} on {dev}"))?;
+        }
+        self.installed.push(InstalledRoute {
+            kind: RouteKind::ExcludedPrefix,
+            spec,
+            tun_name: dev,
+        });
+        Ok(())
+    }
 }
 
 /// Delete a list of installed routes (useful for signal handlers).
 pub fn cleanup_routes(routes: &[InstalledRoute]) {
     info!(routes = routes.len(), "cleaning up routes");
-    for entry in routes {
+    for entry in routes.iter().rev() {
         if let Err(e) = match entry.kind {
             RouteKind::Tun => del_tun_route(&entry.spec, &entry.tun_name),
             RouteKind::EndpointException => del_host_route(&entry.spec),
+            RouteKind::ExcludedPrefix => del_prefix_exception(&entry.spec, &entry.tun_name),
         } {
             warn!(spec = %entry.spec, error = %e, "failed to delete route");
         }
@@ -159,6 +211,35 @@ fn add_host_route_dev(host: &str, dev: &str) -> anyhow::Result<()> {
         anyhow::bail!("ip route add host dev failed");
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_prefix_route_via(prefix: &str, gateway: &str, dev: &str) -> anyhow::Result<()> {
+    let status = Command::new("ip")
+        .args(["route", "add", prefix, "via", gateway, "dev", dev])
+        .status()
+        .context("running ip route add excluded prefix via")?;
+    if !status.success() {
+        anyhow::bail!("ip route add excluded prefix via failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_prefix_route_dev(prefix: &str, dev: &str) -> anyhow::Result<()> {
+    let status = Command::new("ip")
+        .args(["route", "add", prefix, "dev", dev])
+        .status()
+        .context("running ip route add excluded prefix dev")?;
+    if !status.success() {
+        anyhow::bail!("ip route add excluded prefix dev failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn del_prefix_exception(prefix: &str, dev: &str) -> anyhow::Result<()> {
+    delete_linux_route(&["route", "del", prefix, "dev", dev], prefix, Some(dev))
 }
 
 #[cfg(target_os = "linux")]
@@ -316,10 +397,50 @@ fn add_host_route_via(host: &str, gateway: &str, _dev: &str) -> anyhow::Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn add_host_route_dev(host: &str, _dev: &str) -> anyhow::Result<()> {
-    // macOS route requires a gateway address; use "interface" syntax
-    // as a fallback (may not work on all macOS versions).
-    warn!(host = %host, "macOS endpoint exception without gateway; manual route may be required");
+fn add_host_route_dev(host: &str, dev: &str) -> anyhow::Result<()> {
+    let status = Command::new("route")
+        .args(["add", "-host", host, "-interface", dev])
+        .status()
+        .context("running route add host via interface")?;
+    if !status.success() {
+        anyhow::bail!("route add host via interface failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn add_prefix_route_via(prefix: &str, gateway: &str, _dev: &str) -> anyhow::Result<()> {
+    let status = Command::new("route")
+        .args(["add", "-net", prefix, gateway])
+        .status()
+        .context("running route add excluded prefix")?;
+    if !status.success() {
+        anyhow::bail!("route add excluded prefix failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn add_prefix_route_dev(prefix: &str, dev: &str) -> anyhow::Result<()> {
+    let status = Command::new("route")
+        .args(["add", "-net", prefix, "-interface", dev])
+        .status()
+        .context("running route add excluded prefix via interface")?;
+    if !status.success() {
+        anyhow::bail!("route add excluded prefix via interface failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn del_prefix_exception(prefix: &str, _dev: &str) -> anyhow::Result<()> {
+    let status = Command::new("route")
+        .args(["delete", "-net", prefix])
+        .status()
+        .context("running route delete excluded prefix")?;
+    if !status.success() {
+        anyhow::bail!("route delete excluded prefix failed");
+    }
     Ok(())
 }
 
