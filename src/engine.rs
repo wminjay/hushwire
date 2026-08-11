@@ -46,6 +46,7 @@ struct SessionState {
     responder_candidates: HashMap<String, Session>,
     pending_init: HashMap<String, PendingInitiator>,
     responder_cache: HashMap<String, CachedResponderHandshake>,
+    inbound_recovery_preference: HashSet<String>,
 }
 
 pub struct DecryptedTransport {
@@ -233,16 +234,16 @@ impl SessionManager {
     /// the same two random IDs; the smaller ID remains the initiator.
     ///
     /// A peer with no configured destination is intentionally passive and
-    /// relies on a learned roaming endpoint. If that remote process restarts,
-    /// our learned endpoint is stale and a locally pending exchange cannot
-    /// reach it. In that case `prefer_inbound` makes the authenticated fresh
-    /// initiation win instead of leaving recovery to a random identifier
-    /// comparison.
+    /// relies on a learned roaming endpoint. After explicit stale-session
+    /// invalidation, its locally pending recovery exchange can still target
+    /// the old learned endpoint. In that one recovery state, an authenticated
+    /// inbound initiation wins. Normal rekeys always retain the symmetric ID
+    /// comparison so both peers cannot become responders simultaneously.
     pub fn accept_inbound_initiation(
         &self,
         peer_name: &str,
         remote_handshake_id: &[u8; auth::SESSION_ID_SIZE],
-        prefer_inbound: bool,
+        passive_peer: bool,
     ) -> bool {
         let mut state = self.inner.lock().unwrap();
         if state
@@ -252,7 +253,7 @@ impl SessionManager {
         {
             state.pending_init.remove(peer_name);
         }
-        if prefer_inbound {
+        if passive_peer && state.inbound_recovery_preference.remove(peer_name) {
             state.pending_init.remove(peer_name);
             return true;
         }
@@ -393,6 +394,9 @@ impl SessionManager {
         let removed_candidate = state.responder_candidates.remove(peer_name).is_some();
         let removed_pending = state.pending_init.remove(peer_name).is_some();
         state.responder_cache.remove(peer_name);
+        state
+            .inbound_recovery_preference
+            .insert(peer_name.to_string());
         removed_session || removed_previous || removed_candidate || removed_pending
     }
 
@@ -421,6 +425,7 @@ fn session_id_in_use(state: &SessionState, session_id: &[u8; auth::SESSION_ID_SI
 }
 
 fn install_active_session(state: &mut SessionState, peer_name: &str, session: Session) {
+    state.inbound_recovery_preference.remove(peer_name);
     if let Some(previous) = state.sessions.insert(peer_name.to_string(), session) {
         state
             .previous_sessions

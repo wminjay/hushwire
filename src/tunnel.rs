@@ -1088,6 +1088,59 @@ mod tests {
     }
 
     #[test]
+    fn passive_peer_normal_rekey_keeps_symmetric_identifier_tiebreak() {
+        let static_a = StaticSecret::from([0x6d; 32]);
+        let static_b = StaticSecret::from([0x6e; 32]);
+        let public_a = PublicKey::from(&static_a);
+        let public_b = PublicKey::from(&static_b);
+        let psk = [0x6f; 32];
+        let manager_a = SessionManager::new();
+        let manager_b = SessionManager::new();
+        let now = Instant::now();
+
+        complete_managed_handshake(
+            &manager_a, &manager_b, &static_a, &static_b, &public_b, &psk, now,
+        );
+
+        let rekey_at = now + noise::REKEY_AFTER_TIME + Duration::from_secs(1);
+        let packet_a = manager_a
+            .start_or_retry_handshake("peer", &static_a, &public_b, &psk, rekey_at)
+            .unwrap()
+            .unwrap();
+        let packet_b = manager_b
+            .start_or_retry_handshake("peer", &static_b, &public_a, &psk, rekey_at)
+            .unwrap()
+            .unwrap();
+        let auth::ParsedPacket::Handshake {
+            handshake_id: id_a, ..
+        } = auth::decode_packet(&packet_a).unwrap()
+        else {
+            panic!("handshake A");
+        };
+        let auth::ParsedPacket::Handshake {
+            handshake_id: id_b, ..
+        } = auth::decode_packet(&packet_b).unwrap()
+        else {
+            panic!("handshake B");
+        };
+        assert_ne!(id_a, id_b);
+
+        // Put the passive endpoint on the smaller identifier. The active
+        // endpoint must yield to it, while the passive endpoint must retain
+        // its winning local exchange. Unconditionally preferring inbound on
+        // the passive side makes both peers responders and stalls the tunnel.
+        let (passive, passive_id, active, active_id) = if id_a < id_b {
+            (&manager_a, id_a, &manager_b, id_b)
+        } else {
+            (&manager_b, id_b, &manager_a, id_a)
+        };
+        assert!(active.accept_inbound_initiation("peer", &passive_id, false));
+        assert!(!passive.accept_inbound_initiation("peer", &active_id, true));
+        assert!(!active.has_pending_init("peer"));
+        assert!(passive.has_pending_init("peer"));
+    }
+
+    #[test]
     fn passive_peer_prefers_authenticated_inbound_restart_handshake() {
         let local_static = StaticSecret::from([0x71; 32]);
         let remote_static = StaticSecret::from([0x72; 32]);
@@ -1118,9 +1171,29 @@ mod tests {
         assert!(!manager.accept_inbound_initiation("peer", &remote_id, false));
         assert!(manager.has_pending_init("peer"));
 
-        // A passive peer cannot use its stale learned endpoint after the
-        // remote process restarts, so the fresh authenticated inbound exchange
-        // must replace that pending local attempt deterministically.
+        // Explicit liveness recovery marks the next passive inbound exchange
+        // as authoritative because the learned endpoint used by the current
+        // local attempt may belong to the restarted process.
+        assert!(manager.invalidate_peer("peer"));
+        let local_packet = manager
+            .start_or_retry_handshake("peer", &local_static, &remote_public, &[0x73; 32], now)
+            .unwrap()
+            .unwrap();
+        let auth::ParsedPacket::Handshake {
+            handshake_id: local_id,
+            ..
+        } = auth::decode_packet(&local_packet).unwrap()
+        else {
+            panic!("recovery handshake");
+        };
+        let mut remote_id = local_id;
+        let position = remote_id
+            .iter()
+            .position(|byte| *byte != u8::MAX)
+            .expect("random identifier cannot be all 0xff in this test");
+        remote_id[position] += 1;
+        remote_id[position + 1..].fill(0);
+
         assert!(manager.accept_inbound_initiation("peer", &remote_id, true));
         assert!(!manager.has_pending_init("peer"));
     }
