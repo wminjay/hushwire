@@ -17,6 +17,16 @@ HushWire is an experimental WireGuard-like IPv4 L3 tunnel focused on observabili
 
 Each archive has a matching `.sha256` checksum. The GUI app is ad-hoc signed and not notarized; it is intended for personal testing.
 
+## v0.7.0-rc.2: simultaneous-rekey liveness hotfix
+
+This release candidate fixes a liveness regression introduced in v0.7.0-rc.1. When both ends started the scheduled rekey at nearly the same time, a passive endpoint could override the shared handshake-identifier tie-break while the active endpoint still followed it. Some identifier orderings therefore left both endpoints waiting as responders until the stale handshake candidates expired, causing a roughly two-minute traffic interruption.
+
+- Normal scheduled rekeys now use the same deterministic handshake-identifier tie-break at both endpoints.
+- A passive endpoint still prefers an inbound initiation after explicit peer invalidation, preserving recovery when a client restarts or returns from a changed NAT endpoint.
+- Regression coverage verifies both simultaneous scheduled rekey and explicit restart-recovery behavior.
+
+Validation includes the full Rust and macOS test suites, UDP/TCP recovery and multi-peer network-namespace tests, the gateway-policy integration test, and live JP canary rekeys under continuous traffic.
+
 ## v0.7.0-rc.1: controlled network policy release candidate
 
 This release candidate is wire-compatible with v0.6.x. It is not wire-compatible with the v0.4.x/v0.5.x protocol, so both ends of an older link must be staged, restarted, and rollback-protected as one unit. Existing tunnel keys and TOML remain valid; the new `[gateway]` section is optional.
@@ -84,7 +94,7 @@ Do not merge a v0.6 peer into an old production instance until every endpoint at
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
-./hushwire --version       # hushwire 0.7.0-rc.1
+./hushwire --version       # hushwire 0.7.0-rc.2
 ./hushwire genkey
 openssl rand -base64 32
 sudo ./hushwire up -c my-node.toml
