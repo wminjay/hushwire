@@ -407,7 +407,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       addresses: [interface.address],
       subnetMasks: ["255.255.255.255"]
     )
-    ipv4.includedRoutes = plan.includedRoutes.map {
+    ipv4.includedRoutes = plan.packetTunnelIncludedRoutes.map {
       NEIPv4Route(destinationAddress: $0.network, subnetMask: $0.subnetMask)
     }
     // Direct-route exclusions include configured excluded_ips and any

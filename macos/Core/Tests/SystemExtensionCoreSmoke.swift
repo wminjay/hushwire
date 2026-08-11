@@ -131,6 +131,12 @@ enum SystemExtensionCoreSmoke {
       ]
     )
     precondition(
+      fullTunnelPlan.packetTunnelIncludedRoutes == [
+        HushWireIPv4RouteSpec(network: "0.0.0.0", prefixLength: 1),
+        HushWireIPv4RouteSpec(network: "128.0.0.0", prefixLength: 1),
+      ]
+    )
+    precondition(
       fullTunnelPlan.excludedRoutes == [
         HushWireIPv4RouteSpec(network: "192.0.2.10", prefixLength: 32)
       ]
@@ -156,6 +162,50 @@ enum SystemExtensionCoreSmoke {
       defaultTunnelWithExclusionsPlan.summary.directRoutes
         == ["192.0.2.0/24", "10.0.0.0/8"]
     )
+
+    let migratedWireGuardPolicyText = fullTunnelText.replacingOccurrences(
+      of: "allowed_ips = [\"0.0.0.0/0\"]",
+      with:
+        """
+        allowed_ips = ["10.0.0.1/32", "172.16.1.8/32", "0.0.0.0/0"]
+        excluded_ips = ["10.0.0.0/8", "42.187.128.0/17", "58.32.0.0/16", "58.41.0.0/16", "109.244.0.0/19", "218.80.0.0/16"]
+        """
+    )
+    let migratedWireGuardPolicy = try HushWireNetworkPolicy(
+      routePolicy: .fullTunnel,
+      dnsServers: ["192.168.100.1"]
+    )
+    let migratedWireGuardPlan = try HushWireConfigurationPolicy.plan(
+      Data(migratedWireGuardPolicyText.utf8),
+      networkPolicy: migratedWireGuardPolicy
+    )
+    precondition(
+      migratedWireGuardPlan.includedRoutes == [
+        HushWireIPv4RouteSpec(network: "10.0.0.1", prefixLength: 32),
+        HushWireIPv4RouteSpec(network: "172.16.1.8", prefixLength: 32),
+        HushWireIPv4RouteSpec(network: "0.0.0.0", prefixLength: 0),
+      ]
+    )
+    precondition(
+      migratedWireGuardPlan.packetTunnelIncludedRoutes == [
+        HushWireIPv4RouteSpec(network: "10.0.0.1", prefixLength: 32),
+        HushWireIPv4RouteSpec(network: "172.16.1.8", prefixLength: 32),
+        HushWireIPv4RouteSpec(network: "0.0.0.0", prefixLength: 1),
+        HushWireIPv4RouteSpec(network: "128.0.0.0", prefixLength: 1),
+      ]
+    )
+    precondition(
+      migratedWireGuardPlan.excludedRoutes == [
+        HushWireIPv4RouteSpec(network: "192.0.2.10", prefixLength: 32),
+        HushWireIPv4RouteSpec(network: "109.244.0.0", prefixLength: 19),
+        HushWireIPv4RouteSpec(network: "42.187.128.0", prefixLength: 17),
+        HushWireIPv4RouteSpec(network: "218.80.0.0", prefixLength: 16),
+        HushWireIPv4RouteSpec(network: "58.32.0.0", prefixLength: 16),
+        HushWireIPv4RouteSpec(network: "58.41.0.0", prefixLength: 16),
+        HushWireIPv4RouteSpec(network: "10.0.0.0", prefixLength: 8),
+      ]
+    )
+    precondition(migratedWireGuardPlan.dnsServers == ["192.168.100.1"])
 
     let providerConfiguration = fullTunnelPolicy.addingProviderConfiguration(to: [
       "schemaVersion": 4,

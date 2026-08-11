@@ -446,6 +446,74 @@ mod tests {
     }
 
     #[test]
+    fn wireguard_complement_policy_can_be_expressed_as_six_exclusions() {
+        let mut home = peer_multi(
+            "home",
+            &["10.0.0.1/32", "172.16.1.8/32", "0.0.0.0/0"],
+            "192.0.2.10:11063",
+        );
+        home.excluded_ips = [
+            "10.0.0.0/8",
+            "42.187.128.0/17",
+            "58.32.0.0/16",
+            "58.41.0.0/16",
+            "109.244.0.0/19",
+            "218.80.0.0/16",
+        ]
+        .into_iter()
+        .map(|prefix| prefix.parse().unwrap())
+        .collect();
+        let config = Config {
+            interface: InterfaceConfig {
+                name: "utun10".to_string(),
+                address: "10.77.0.1/24".parse().unwrap(),
+                listen: "127.0.0.1:27777".parse().unwrap(),
+                transport: Default::default(),
+                mtu: 1280,
+                private_key: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=".to_string(),
+            },
+            gateway: None,
+            peer: vec![home],
+        };
+
+        let router = Router::new(&config).expect("router");
+
+        // These are the two explicit home destinations from the original
+        // WireGuard policy. The /32 include wins over the broader 10/8
+        // exclusion, while the 172 address remains explicit for intent.
+        assert!(router.lookup("10.0.0.1".parse().unwrap()).is_some());
+        assert!(router.lookup("172.16.1.8".parse().unwrap()).is_some());
+
+        for destination in [
+            "10.0.0.2",
+            "42.187.128.1",
+            "58.32.1.1",
+            "58.41.1.1",
+            "109.244.0.1",
+            "218.80.1.1",
+        ] {
+            assert!(
+                router.lookup(destination.parse().unwrap()).is_none(),
+                "{destination} should stay on the physical network"
+            );
+        }
+
+        for destination in [
+            "1.1.1.1",
+            "42.187.127.255",
+            "58.33.0.1",
+            "58.42.0.1",
+            "109.244.32.1",
+            "218.81.0.1",
+        ] {
+            assert!(
+                router.lookup(destination.parse().unwrap()).is_some(),
+                "{destination} should use the tunnel"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_exclusion_also_prevents_redundant_endpoint_exception() {
         let mut home = peer("home", "0.0.0.0/0", "192.0.2.10:11063");
         home.excluded_ips = vec!["192.0.2.0/24".parse().unwrap()];

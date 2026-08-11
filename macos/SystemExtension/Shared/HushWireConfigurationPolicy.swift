@@ -197,6 +197,26 @@ struct HushWireConfigurationPlan: Equatable {
   let includedRoutes: [HushWireIPv4RouteSpec]
   let excludedRoutes: [HushWireIPv4RouteSpec]
   let dnsServers: [String]
+
+  /// Routes rendered into `NEIPv4Settings`.
+  ///
+  /// Keep `0.0.0.0/0` in the semantic plan and in the HushWire core, but
+  /// express it to macOS as the equivalent pair of /1 routes. A directly
+  /// installed default route can appear in the macOS routing table while
+  /// sends through a /32-addressed packet tunnel still fail with
+  /// `EHOSTUNREACH`. The two /1 routes avoid that special default-route path
+  /// without changing configured allowed/excluded-prefix precedence.
+  var packetTunnelIncludedRoutes: [HushWireIPv4RouteSpec] {
+    includedRoutes.flatMap { route in
+      guard route.network == "0.0.0.0", route.prefixLength == 0 else {
+        return [route]
+      }
+      return [
+        HushWireIPv4RouteSpec(network: "0.0.0.0", prefixLength: 1),
+        HushWireIPv4RouteSpec(network: "128.0.0.0", prefixLength: 1),
+      ]
+    }
+  }
 }
 
 enum HushWireConfigurationPolicy {
