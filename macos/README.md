@@ -1,8 +1,8 @@
-# HushWire for macOS (Personal Client)
+# HushWire for macOS
 
-This directory contains a small native SwiftUI client intended for a single user's Mac. It reuses the existing Rust tunnel core and does not install a persistent privileged helper or use Apple's Network Extension framework.
+This directory contains two native SwiftUI clients: the current Packet Tunnel System Extension GUI and the earlier CLI-backed personal client retained for local development. The release-candidate System Extension uses Apple's Network Extension lifecycle and does not install a persistent privileged helper.
 
-## What it does
+## Legacy CLI-backed client
 
 - selects and remembers one TOML configuration
 - validates the configuration before connection
@@ -32,7 +32,7 @@ From the repository root:
 open dist/HushWire.app
 ```
 
-The result is `dist/HushWire.app`. It receives an ad-hoc local signature, which is sufficient for an app built and used on the same Mac. A Developer ID certificate and notarization would be needed before distributing it to other people.
+The result is `dist/HushWire.app`. This legacy CLI-backed target receives an ad-hoc local signature and is intended only for same-Mac development. The System Extension target described below has a separate Developer ID direct-distribution packager with notarization and stapling.
 
 To assemble a second test build without replacing an app that is already
 running, choose a staging directory below `dist`:
@@ -58,7 +58,7 @@ until the callback returns, and `stop` waits for in-flight callbacks before it
 erases session state. The framework contains protocol logic only: macOS still
 owns packet flow, routes, DNS, and the UDP/TCP transport lifecycle.
 
-## Packet Tunnel System Extension preview
+## Packet Tunnel System Extension
 
 The Xcode project is generated from `project.yml`; generated project state is
 ignored so signing and target changes stay reviewable. Build the lifecycle-only
@@ -157,7 +157,7 @@ allowed_ips = ["10.0.0.1/32", "0.0.0.0/0"]
 excluded_ips = ["10.0.0.0/8"]
 ```
 
-The v0.6.1 GitHub release also includes `HushWire-aarch64-macos-app.zip` for Apple Silicon. It uses the same ad-hoc signature and is not notarized, so it is intended for personal testing; macOS may require using **Open** from Finder's context menu on first launch. Building locally remains the most predictable option.
+The v0.6.1 GitHub release also includes the legacy `HushWire-aarch64-macos-app.zip` for Apple Silicon. That historical artifact uses the same ad-hoc signature and is not notarized. Starting with the v0.7.0 release candidates, use the universal Developer ID-notarized System Extension GUI artifact documented above.
 
 ## Prepare a client configuration
 

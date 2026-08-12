@@ -164,7 +164,10 @@ See the [README](https://github.com/wminjay/hushwire/blob/main/README.md) for co
 
 - HushWire is experimental and has not received an independent security audit.
 - Wire protocol v3 has no compatibility mode for v2.
-- IPv4 only; DNS configuration is not managed.
+- IPv4 only; the macOS Network Extension can apply explicit DNS servers in
+  split/full-tunnel modes, while the CLI does not manage system DNS.
 - exit-node NAT is Linux-only.
 - UDP and TCP are selected per process; one process does not listen on both transports simultaneously.
-- the macOS app is a personal, ad-hoc-signed client rather than a Network Extension/App Store VPN.
+- the macOS GUI is a direct-distribution, Developer ID-notarized Network Extension
+  release candidate; it is not an App Store build and remains intended for
+  controlled testing.

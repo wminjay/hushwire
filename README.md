@@ -23,19 +23,19 @@ sudo ./target/release/hushwire up -c my-node.toml
 ./target/release/hushwire doctor   -c my-node.toml
 ```
 
-## macOS Personal Client
+## macOS Clients
 
-A native SwiftUI client for personal, direct-install use lives in [`macos/`](macos/README.md). It bundles the Rust tunnel binary and provides config selection, validation, key generation, connect/disconnect controls, and live logs.
+A native SwiftUI client for personal, direct-install use lives in [`macos/`](macos/README.md). The current release-candidate GUI uses a Packet Tunnel System Extension and provides route-policy selection, config import, connect/disconnect controls, and live session state. The repository also retains the earlier CLI-backed local-development client.
 
 ```sh
 ./macos/scripts/build-app.sh
 open dist/HushWire.app
 ```
 
-The local build uses an ad-hoc signature and macOS requests administrator authorization when starting or stopping the tunnel. It is not an App Store or Network Extension build.
+The legacy local build uses an ad-hoc signature and macOS requests administrator authorization when starting or stopping that CLI-backed tunnel. The v0.7.0 release-candidate GUI is a separate Developer ID-notarized Network Extension build; see [`macos/README.md`](macos/README.md) for its direct-distribution packaging and installation flow.
 
 The platform-independent Rust packet engine also exports a versioned C ABI for
-the in-progress Packet Tunnel System Extension. A universal macOS XCFramework
+the Packet Tunnel System Extension. A universal macOS XCFramework
 and its Swift linkage smoke test can be built with:
 
 ```sh
