@@ -199,6 +199,9 @@ staged_extension="$staged_app/Contents/Library/SystemExtensions/$extension_bundl
 test -d "$staged_extension"
 ditto "$app_profile" "$staged_app/Contents/embedded.provisionprofile"
 ditto "$extension_profile" "$staged_extension/Contents/embedded.provisionprofile"
+chmod 0644 \
+  "$staged_app/Contents/embedded.provisionprofile" \
+  "$staged_extension/Contents/embedded.provisionprofile"
 
 codesign \
   --force \
@@ -234,10 +237,14 @@ for signed_entitlements in \
   fi
 done
 for signed_bundle in "$staged_extension" "$staged_app"; do
-  if ! codesign -dvv "$signed_bundle" 2>&1 | grep -Eq 'flags=.*runtime'; then
-    echo "Signed bundle is missing Hardened Runtime: $signed_bundle" >&2
-    exit 78
-  fi
+  signature_details="$(codesign -dvv "$signed_bundle" 2>&1)"
+  case "$signature_details" in
+    *"flags="*"runtime"*) ;;
+    *)
+      echo "Signed bundle is missing Hardened Runtime: $signed_bundle" >&2
+      exit 78
+      ;;
+  esac
 done
 
 lipo "$staged_app/Contents/MacOS/HushWire" -verify_arch arm64 x86_64
