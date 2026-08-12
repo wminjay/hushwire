@@ -83,6 +83,9 @@ jobs:
             macos/SystemExtension/App/HushWire.direct.entitlements
           grep -q 'packet-tunnel-provider-systemextension' \
             macos/SystemExtension/PacketTunnel/HushWirePacketTunnel.direct.entitlements
+          test "$(plutil -extract NetworkExtension.NEMachServiceName raw -o - \
+            macos/SystemExtension/PacketTunnel/Info.plist)" = \
+            '95Q852BXKJ.com.jamie.HushWire.shared.PacketTunnel'
           set +e
           output=$(macos/Resources/hushwire-control status "$(id -u)")
           result=$?

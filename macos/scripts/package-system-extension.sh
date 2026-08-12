@@ -7,8 +7,11 @@ repository_root="$(cd "$script_directory/../.." && pwd)"
 team_id="95Q852BXKJ"
 app_bundle_id="com.jamie.HushWire"
 extension_bundle_id="com.jamie.HushWire.PacketTunnel"
+app_group_id="$team_id.$app_bundle_id.shared"
+extension_mach_service="$app_group_id.PacketTunnel"
 app_entitlements="$repository_root/macos/SystemExtension/App/HushWire.direct.entitlements"
 extension_entitlements="$repository_root/macos/SystemExtension/PacketTunnel/HushWirePacketTunnel.direct.entitlements"
+extension_info_plist="$repository_root/macos/SystemExtension/PacketTunnel/Info.plist"
 app_profile="${HUSHWIRE_DEVELOPER_ID_APP_PROFILE:-}"
 extension_profile="${HUSHWIRE_DEVELOPER_ID_EXTENSION_PROFILE:-}"
 signing_identity="${HUSHWIRE_DEVELOPER_ID_IDENTITY:-}"
@@ -104,6 +107,15 @@ for entitlements in "$app_entitlements" "$extension_entitlements"; do
     echo "Direct-distribution entitlement is missing from $entitlements" >&2
     exit 78
   fi
+  application_groups="$(
+    /usr/libexec/PlistBuddy \
+      -c "Print :com.apple.security.application-groups" \
+      "$entitlements"
+  )"
+  if [[ "$application_groups" != *"$app_group_id"* ]]; then
+    echo "Direct-distribution App Group is missing from $entitlements" >&2
+    exit 78
+  fi
   if /usr/libexec/PlistBuddy \
       -c "Print :com.apple.security.get-task-allow" \
       "$entitlements" >/dev/null 2>&1; then
@@ -111,6 +123,16 @@ for entitlements in "$app_entitlements" "$extension_entitlements"; do
     exit 78
   fi
 done
+
+configured_mach_service="$(
+  plutil -extract NetworkExtension.NEMachServiceName raw -o - \
+    "$extension_info_plist"
+)"
+if [[ "$configured_mach_service" != "$extension_mach_service" ]]; then
+  echo "NEMachServiceName must be prefixed by the direct-distribution App Group" >&2
+  echo "Expected $extension_mach_service, found $configured_mach_service" >&2
+  exit 78
+fi
 
 mkdir -p "$repository_root/dist" "$release_output"
 working_directory="$(mktemp -d "$repository_root/dist/hushwire-developer-id.XXXXXX")"
@@ -197,6 +219,14 @@ ditto "$unsigned_app" "$staged_app"
 
 staged_extension="$staged_app/Contents/Library/SystemExtensions/$extension_bundle_id.systemextension"
 test -d "$staged_extension"
+packaged_mach_service="$(
+  plutil -extract NetworkExtension.NEMachServiceName raw -o - \
+    "$staged_extension/Contents/Info.plist"
+)"
+if [[ "$packaged_mach_service" != "$extension_mach_service" ]]; then
+  echo "Packaged System Extension has an invalid NEMachServiceName: $packaged_mach_service" >&2
+  exit 78
+fi
 ditto "$app_profile" "$staged_app/Contents/embedded.provisionprofile"
 ditto "$extension_profile" "$staged_extension/Contents/embedded.provisionprofile"
 chmod 0644 \
