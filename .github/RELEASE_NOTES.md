@@ -13,9 +13,20 @@ HushWire is an experimental WireGuard-like IPv4 L3 tunnel focused on observabili
 | `hushwire-x86_64-linux.tar.gz` | Linux x86_64 (static) |
 | `hushwire-aarch64-linux.tar.gz` | Linux ARM64 (static) |
 | `hushwire-aarch64-macos.tar.gz` | macOS Apple Silicon |
-| `HushWire-aarch64-macos-app.zip` | macOS Apple Silicon personal GUI client |
+| `HushWire-0.7.0-macos-universal.zip` | macOS universal System Extension GUI client |
 
-Each archive has a matching `.sha256` checksum. The GUI app is ad-hoc signed and not notarized; it is intended for personal testing.
+Each archive has a matching `.sha256` checksum. The GUI is signed with Developer ID, notarized by Apple, stapled, and includes both Apple Silicon and Intel binaries. It remains a release candidate intended for controlled testing.
+
+## v0.7.0-rc.4: notarized macOS upgrade candidate
+
+This release candidate is wire-compatible with v0.6.x and the earlier v0.7.0 candidates. It does not change the tunnel protocol or network-policy behavior.
+
+- The macOS System Extension GUI is now packaged for direct distribution with Developer ID application signing, direct-distribution provisioning profiles, Hardened Runtime, Apple notarization, and a stapled ticket.
+- The App build advances to 19 and the embedded Packet Tunnel extension to 16 so macOS reliably replaces an already-active development build instead of treating the equal-version extension as already installed.
+- Embedded provisioning profiles are normalized to world-readable mode before signing. This prevents a root-owned `/Applications` installation from failing at launch because the current user cannot read its profiles.
+- Hardened Runtime verification no longer produces a false failure under `pipefail` when `grep -q` closes its pipe before `codesign` finishes writing.
+
+Validation includes signature and entitlement inspection, Gatekeeper assessment, notarization and stapler verification, universal-architecture checks, and an isolated macOS VM upgrade from the development-signed extension. The VM gate also covers `/32` tunnel connection, authenticated traffic, explicit disconnect, and restoration of the original physical default route.
 
 ## v0.7.0-rc.3: macOS policy routing and lifecycle hardening
 
@@ -109,7 +120,7 @@ Do not merge a v0.6 peer into an old production instance until every endpoint at
 
 ```sh
 tar xzf hushwire-<arch>-<os>.tar.gz
-./hushwire --version       # hushwire 0.7.0-rc.3
+./hushwire --version       # hushwire 0.7.0-rc.4
 ./hushwire genkey
 openssl rand -base64 32
 sudo ./hushwire up -c my-node.toml
