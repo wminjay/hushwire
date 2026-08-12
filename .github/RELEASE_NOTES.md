@@ -22,7 +22,8 @@ Each archive has a matching `.sha256` checksum. The GUI is signed with Developer
 This release candidate is wire-compatible with v0.6.x and the earlier v0.7.0 candidates. It does not change the tunnel protocol or network-policy behavior.
 
 - The macOS System Extension GUI is now packaged for direct distribution with Developer ID application signing, direct-distribution provisioning profiles, Hardened Runtime, Apple notarization, and a stapled ticket.
-- The App build advances to 19 and the embedded Packet Tunnel extension to 16 so macOS reliably replaces an already-active development build instead of treating the equal-version extension as already installed.
+- The App build advances to 20 and the embedded Packet Tunnel extension to 17 so macOS reliably replaces an already-active development build instead of treating the equal-version extension as already installed.
+- The Packet Tunnel Mach service is explicitly namespaced beneath the direct-distribution App Group, satisfying NetworkExtension category validation during an upgrade from a development-signed extension.
 - Embedded provisioning profiles are normalized to world-readable mode before signing. This prevents a root-owned `/Applications` installation from failing at launch because the current user cannot read its profiles.
 - Hardened Runtime verification no longer produces a false failure under `pipefail` when `grep -q` closes its pipe before `codesign` finishes writing.
 
