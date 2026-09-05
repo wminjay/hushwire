@@ -18,7 +18,7 @@ use crate::engine::{Engine, EngineAction, EngineEvent, EngineOutput, HandshakeRo
 use crate::router::Router;
 use crate::scheduler::EngineScheduler;
 
-pub const HW_CORE_ABI_VERSION: u32 = 2;
+pub const HW_CORE_ABI_VERSION: u32 = 3;
 const ERROR_MESSAGE_CAPACITY: usize = 512;
 
 #[repr(i32)]
@@ -702,6 +702,89 @@ pub unsafe extern "C" fn hw_runtime_invalidate_peer(
     })
 }
 
+/// Resolve the configured endpoint for a peer without changing runtime state.
+///
+/// Platform adapters use this on a background queue after a liveness timeout,
+/// then prepare any endpoint exception route before applying the result.
+///
+/// # Safety
+/// Peer-name, output, runtime, and error pointers must remain valid for the
+/// duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn hw_runtime_resolve_peer_endpoint(
+    runtime: *mut HwRuntime,
+    peer_name: *const u8,
+    peer_name_length: usize,
+    output: *mut HwEndpoint,
+    error: *mut HwError,
+) -> HwStatus {
+    guarded_status(error, || {
+        let runtime = runtime_ref(runtime)?;
+        let peer_name = borrowed_string(peer_name, peer_name_length, "peer_name")?;
+        let _call = runtime.begin_call()?;
+        let peer = runtime
+            .config
+            .peer
+            .iter()
+            .find(|peer| peer.name == peer_name)
+            .ok_or_else(|| {
+                FfiFailure::new(
+                    HwStatus::InvalidArgument,
+                    format!("unknown peer: {peer_name}"),
+                )
+            })?;
+        let endpoint = peer.endpoint.resolve().map_err(|cause| {
+            FfiFailure::new(
+                HwStatus::EngineError,
+                format!("could not resolve endpoint {}: {cause}", peer.endpoint),
+            )
+        })?;
+        let output = output.as_mut().ok_or_else(|| {
+            FfiFailure::new(
+                HwStatus::InvalidArgument,
+                "endpoint output must not be null",
+            )
+        })?;
+        *output = endpoint_to_ffi(endpoint);
+        Ok(())
+    })
+}
+
+/// Apply a previously resolved endpoint after the adapter has protected its
+/// physical route. A changed endpoint clears stale roaming and session state;
+/// the caller must start a replacement handshake.
+///
+/// # Safety
+/// Peer-name, endpoint, runtime, and error pointers must remain valid for the
+/// duration of this call. `changed` is optional.
+#[no_mangle]
+pub unsafe extern "C" fn hw_runtime_update_peer_endpoint(
+    runtime: *mut HwRuntime,
+    peer_name: *const u8,
+    peer_name_length: usize,
+    endpoint: *const HwEndpoint,
+    changed: *mut u8,
+    error: *mut HwError,
+) -> HwStatus {
+    guarded_status(error, || {
+        let runtime = runtime_ref(runtime)?;
+        let peer_name = borrowed_string(peer_name, peer_name_length, "peer_name")?;
+        let endpoint = endpoint.as_ref().ok_or_else(|| {
+            FfiFailure::new(HwStatus::InvalidArgument, "endpoint must not be null")
+        })?;
+        let endpoint = endpoint_from_ffi(endpoint)?;
+        let call = runtime.begin_call()?;
+        let endpoint_changed = call
+            .engine
+            .update_resolved_endpoint(peer_name, endpoint)
+            .map_err(|cause| FfiFailure::new(HwStatus::EngineError, cause.to_string()))?;
+        if let Some(changed) = changed.as_mut() {
+            *changed = u8::from(endpoint_changed);
+        }
+        Ok(())
+    })
+}
+
 /// Record a transport send that completed asynchronously after its callback.
 ///
 /// A transport callback that returns nonzero is recorded automatically and
@@ -1244,6 +1327,70 @@ udp_rebind_after = 20
 
             hw_runtime_destroy(runtime_a);
             hw_runtime_destroy(runtime_b);
+        }
+    }
+
+    #[test]
+    fn ffi_resolves_and_updates_peer_endpoint_before_recovery_handshake() {
+        let private_a = [0x61; 32];
+        let private_b = [0x62; 32];
+        let public_b = PublicKey::from(&StaticSecret::from(private_b)).to_bytes();
+        let config_a = config(TestConfig {
+            name: "ffi-a",
+            address: "10.77.91.1/30",
+            listen: "127.0.0.1:41101".to_string(),
+            private_key: private_a,
+            peer_name: "b",
+            peer_address: "10.77.91.2/32",
+            peer_endpoint: "localhost:41102".to_string(),
+            peer_public_key: public_b,
+            psk: [0x63; 32],
+        });
+        let mut capture = Capture::default();
+
+        unsafe {
+            let runtime = create_runtime(&config_a, &mut capture);
+            let mut error = HwError::default();
+            let mut resolved = HwEndpoint::default();
+            assert_eq!(
+                hw_runtime_resolve_peer_endpoint(
+                    runtime,
+                    b"b".as_ptr(),
+                    1,
+                    &mut resolved,
+                    &mut error,
+                ),
+                HwStatus::Ok,
+                "{}",
+                error_text(&error)
+            );
+            assert_eq!(resolved.port, 41102);
+            assert_eq!(resolved.family, 4);
+
+            let replacement = endpoint_to_ffi("127.0.0.2:41102".parse().unwrap());
+            let mut changed = 0;
+            assert_eq!(
+                hw_runtime_update_peer_endpoint(
+                    runtime,
+                    b"b".as_ptr(),
+                    1,
+                    &replacement,
+                    &mut changed,
+                    &mut error,
+                ),
+                HwStatus::Ok,
+                "{}",
+                error_text(&error)
+            );
+            assert_eq!(changed, 1);
+            assert_eq!(
+                hw_runtime_initiate_handshake(runtime, b"b".as_ptr(), 1, &mut error),
+                HwStatus::Ok
+            );
+            assert_eq!(capture.transport.pop_front().unwrap().endpoint, replacement);
+
+            assert_eq!(hw_runtime_stop(runtime, &mut error), HwStatus::Ok);
+            hw_runtime_destroy(runtime);
         }
     }
 

@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+
+<html class="light" lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" name="viewport"/>
+<title>HushWire - Disconnected</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#eff6ff',
+                            100: '#dbeafe',
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                            700: '#1d4ed8',
+                        },
+                        surface: {
+                            50: '#f8fafc',
+                            100: '#f1f5f9',
+                            200: '#e2e8f0',
+                            800: '#1e293b',
+                            900: '#0f172a',
+                        }
+                    },
+                    fontFamily: {
+                        headline: ["Inter", "sans-serif"],
+                        display: ["Inter", "sans-serif"],
+                        body: ["Inter", "sans-serif"],
+                        label: ["Inter", "sans-serif"],
+                        mono: ["ui-monospace", "SFMono-Regular", "Menlo", "Monaco", "Consolas", "Liberation Mono", "Courier New", "monospace"]
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.5rem",
+                        "lg": "1rem",
+                        "xl": "1.5rem",
+                        "2xl": "2rem",
+                        "full": "9999px"
+                    }
+                },
+            },
+        }
+    </script>
+<style>
+        body {
+            -webkit-tap-highlight-color: transparent;
+            background-color: #f8fafc; /* surface-50 */
+        }
+        .pb-safe { padding-bottom: env(safe-area-inset-bottom, 24px); }
+        .pt-safe { padding-top: env(safe-area-inset-top, 44px); }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+</head>
+<body class="font-body text-slate-900 bg-surface-50 antialiased min-h-screen flex flex-col relative pt-safe pb-safe selection:bg-primary-100">
+<!-- TopAppBar -->
+<header class="fixed top-0 w-full z-50 bg-white/80 dark:bg-black/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 pt-safe">
+<div class="flex justify-between items-center px-4 h-11 w-full">
+<div class="absolute left-1/2 -translate-x-1/2">
+<h1 class="text-xl font-headline font-bold text-slate-900 dark:text-slate-50 tracking-tight">HushWire</h1>
+</div>
+<div>
+<button class="p-2 hover:opacity-70 transition-opacity active:scale-95 transition-transform text-slate-600 flex items-center justify-center rounded-full">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 0;">settings</span>
+</button>
+</div>
+</div>
+</header>
+<!-- Main Content Canvas -->
+<main class="flex-1 flex flex-col items-center px-4 pb-24 max-w-lg mx-auto w-full pt-12"><div class="w-full flex justify-center mb-2">
+<button class="flex items-center gap-1.5 px-4 py-2 rounded-full bg-white border border-slate-200 shadow-sm hover:bg-slate-50 active:scale-95 transition-all min-h-[44px]">
+<div class="w-5 h-5 rounded-full bg-slate-300 flex items-center justify-center text-[10px] font-bold text-slate-600">台</div>
+<span class="text-sm font-semibold text-slate-700">台湾测试节点</span>
+<span class="material-symbols-outlined text-[18px] text-slate-400">expand_more</span>
+</button>
+</div>
+<!-- Central Shield Area -->
+<div class="flex flex-col items-center justify-center mt-12 mb-10 w-full">
+<div class="w-32 h-32 rounded-full bg-slate-100 border-2 border-slate-200 flex items-center justify-center mb-6 shadow-sm">
+<span class="material-symbols-outlined text-[64px] text-slate-300" style="font-variation-settings: 'FILL' 0;">shield</span>
+</div>
+<h2 class="text-3xl font-bold font-headline text-slate-900 mb-2">未连接</h2>
+<p class="text-sm text-slate-500">流量未经过 HushWire</p>
+</div>
+<!-- Primary Action Button -->
+<div class="w-full mb-8">
+<button class="w-full h-14 bg-primary-600 hover:bg-primary-700 active:scale-[0.98] transition-all duration-200 rounded-xl text-white font-semibold text-lg flex items-center justify-center gap-2 shadow-sm">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">power_settings_new</span>
+                连接
+            </button>
+</div>
+<!-- Route Impact Chip -->
+<div class="w-full bg-white rounded-xl p-4 border border-slate-200 shadow-sm mb-4 flex items-start gap-3">
+<div class="mt-0.5">
+<span class="material-symbols-outlined text-slate-400">route</span>
+</div>
+<div>
+<h3 class="text-sm font-semibold text-slate-900">仅指定地址</h3>
+<p class="text-[13px] text-slate-500 mt-0.5">默认路由与 DNS 不会修改</p>
+</div>
+</div>
+<!-- Saved Profile Summary -->
+<div class="w-full bg-white rounded-xl border border-slate-200 shadow-sm mb-4 overflow-hidden">
+<div class="p-4 space-y-3">
+<div class="flex justify-between items-center">
+<span class="text-[13px] text-slate-500 font-medium">Endpoint</span>
+<span class="text-[13px] font-mono text-slate-700">154.40.60.58:27783</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="text-[13px] text-slate-500 font-medium">Protocol</span>
+<span class="text-[13px] font-mono text-slate-700">UDP · MTU 1280</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="text-[13px] text-slate-500 font-medium">Tunnel Address</span>
+<span class="text-[13px] font-mono text-slate-700">10.77.60.2/30</span>
+</div>
+</div>
+<div class="border-t border-slate-100 bg-slate-50/50 p-0">
+<button class="w-full py-3 text-sm font-medium text-primary-600 flex items-center justify-center gap-1 hover:bg-slate-50 active:bg-slate-100 transition-colors">
+                    查看配置
+                    <span class="material-symbols-outlined text-[16px]">chevron_right</span>
+</button>
+</div>
+</div>
+<!-- Last Session Summary -->
+<div class="w-full flex justify-between items-center px-2 py-4">
+<div class="flex items-center gap-1.5 text-slate-400">
+<span class="material-symbols-outlined text-[16px]">history</span>
+<span class="text-[12px] font-medium">上次连接 18 分钟</span>
+</div>
+<div class="flex items-center gap-1.5 text-slate-400">
+<span class="material-symbols-outlined text-[16px]">download</span>
+<span class="text-[12px] font-medium font-mono">已接收 1.7 GB</span>
+</div>
+</div>
+</main>
+<!-- BottomNavBar -->
+<nav class="fixed bottom-0 left-0 w-full flex justify-around items-center h-12 px-6 pb-safe bg-white/90 dark:bg-black/90 backdrop-blur-lg border-t border-slate-200 dark:border-slate-800 z-50">
+<!-- Active: 连接 -->
+<button class="flex flex-col items-center justify-center text-blue-600 dark:text-blue-400 hover:bg-slate-50 dark:hover:bg-slate-900 active:opacity-80 transition-all rounded-lg p-1 w-16">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">bolt</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">连接</span>
+</button>
+<!-- Inactive: 配置 -->
+<button class="flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-900 active:opacity-80 transition-all rounded-lg p-1 w-16">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 0;">description</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">配置</span>
+</button>
+<!-- Inactive: 诊断 -->
+<button class="flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-900 active:opacity-80 transition-all rounded-lg p-1 w-16">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 0;">analytics</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">诊断</span>
+</button>
+</nav>
+<div class="fixed inset-0 z-[100] flex flex-col justify-end">
+<!-- Dimmed Backdrop -->
+<div class="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity"></div>
+<!-- Bottom Sheet Container -->
+<div class="relative bg-white dark:bg-slate-900 rounded-t-xl shadow-2xl w-full max-w-lg mx-auto transition-transform transform translate-y-0 pb-safe">
+<!-- Drag Indicator -->
+<div class="flex justify-center pt-3 pb-1">
+<div class="w-10 h-1 bg-slate-300 dark:bg-slate-700 rounded-full"></div>
+</div>
+<!-- Header -->
+<div class="px-4 py-2 flex items-center justify-between">
+<div class="w-10"></div> <!-- Spacer for centering -->
+<h2 class="text-lg font-bold font-headline text-slate-900 dark:text-slate-50">选择连接配置</h2>
+<button class="w-10 h-10 flex items-center justify-center rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500">
+<span class="material-symbols-outlined text-[20px]">close</span>
+</button>
+</div>
+<!-- Subtitle -->
+<div class="px-4 pb-4 text-center">
+<p class="text-[13px] text-slate-500">一次只能启用一个隧道</p>
+</div>
+<!-- Profile List -->
+<div class="px-4 space-y-2 max-h-[60vh] overflow-y-auto">
+<!-- Profile 1 (Selected) -->
+<button class="w-full flex items-center gap-3 p-3 rounded-xl bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-800 min-h-[44px] text-left">
+<div class="w-10 h-10 rounded-full bg-blue-100 dark:bg-blue-800 flex items-center justify-center text-blue-600">
+<span class="material-symbols-outlined">shield</span>
+</div>
+<div class="flex-1">
+<div class="flex items-center gap-2">
+<span class="font-semibold text-slate-900 dark:text-slate-50">台湾测试节点</span>
+<span class="text-[10px] px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-800 text-blue-700 dark:text-blue-300 font-bold uppercase">UDP</span>
+<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-bold">指定地址</span>
+</div>
+<p class="text-[12px] font-mono text-slate-500 mt-0.5">154.40.60.58:27783</p>
+</div>
+<span class="material-symbols-outlined text-blue-600">check_circle</span>
+</button>
+<!-- Profile 2 -->
+<button class="w-full flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-800 border border-slate-100 dark:border-slate-700 min-h-[44px] text-left hover:bg-slate-50">
+<div class="w-10 h-10 rounded-full bg-slate-100 dark:bg-slate-700 flex items-center justify-center text-slate-400">
+<span class="material-symbols-outlined">shield</span>
+</div>
+<div class="flex-1">
+<div class="flex items-center gap-2">
+<span class="font-semibold text-slate-900 dark:text-slate-50">LAX 全局出口</span>
+<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400 font-bold uppercase">UDP</span>
+<span class="text-[10px] px-1.5 py-0.5 rounded bg-primary-100 text-primary-700 font-bold">全局</span>
+</div>
+<p class="text-[12px] font-mono text-slate-500 mt-0.5">45.59.186.66:27781</p>
+</div>
+</button>
+<!-- Profile 3 -->
+<button class="w-full flex items-center gap-3 p-3 rounded-xl bg-white dark:bg-slate-800 border border-slate-100 dark:border-slate-700 min-h-[44px] text-left hover:bg-slate-50">
+<div class="w-10 h-10 rounded-full bg-slate-100 dark:bg-slate-700 flex items-center justify-center text-slate-400">
+<span class="material-symbols-outlined">shield</span>
+</div>
+<div class="flex-1">
+<div class="flex items-center gap-2">
+<span class="font-semibold text-slate-900 dark:text-slate-50">LAX TCP 测试</span>
+<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400 font-bold uppercase">TCP</span>
+<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-bold">指定地址</span>
+</div>
+<p class="text-[12px] font-mono text-slate-500 mt-0.5">45.59.186.66:27782</p>
+</div>
+</button>
+</div>
+<!-- Footer Actions -->
+<div class="p-4 space-y-4">
+<p class="text-[11px] text-slate-400 text-center">连接时无法切换配置</p>
+<button class="w-full h-12 border-2 border-slate-200 dark:border-slate-700 rounded-xl text-slate-700 dark:text-slate-300 font-semibold flex items-center justify-center gap-2 hover:bg-slate-50 active:scale-[0.98] transition-all">
+<span class="material-symbols-outlined">file_upload</span>
+        导入新的 TOML
+      </button>
+</div>
+</div>
+</div></body></html>

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+
+<html class="light" lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" name="viewport"/>
+<title>HushWire - 配置</title>
+<!-- Material Symbols -->
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<!-- Tailwind CSS -->
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<!-- Tailwind Config injected from Design System -->
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {},
+            "borderRadius": {
+              "DEFAULT": "0.5rem",
+              "lg": "1rem",
+              "xl": "1.5rem",
+              "full": "9999px"
+            },
+            "spacing": {},
+            "fontFamily": {
+              "headline": [
+                "Inter", "sans-serif"
+              ],
+              "display": [
+                "Inter", "sans-serif"
+              ],
+              "body": [
+                "Inter", "sans-serif"
+              ],
+              "label": [
+                "Inter", "sans-serif"
+              ]
+            },
+            "fontSize": {}
+          },
+        },
+      }
+    </script>
+<style>
+        /* iOS specific tweaks */
+        body {
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        .pb-safe {
+            padding-bottom: env(safe-area-inset-bottom, 20px);
+        }
+        .pt-safe {
+            padding-top: env(safe-area-inset-top, 0px);
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-slate-50 text-slate-900 font-body min-h-screen selection:bg-blue-200">
+<!-- TopAppBar (Shared Component) -->
+<header class="fixed top-0 w-full z-50 bg-white/80 dark:bg-black/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 flex justify-between items-center px-4 h-11 pt-safe">
+<!-- Leading Avatar -->
+<div class="h-7 w-7 rounded-full bg-slate-200 flex items-center justify-center overflow-hidden">
+<span class="material-symbols-outlined text-[18px] text-slate-500">person</span>
+</div>
+<!-- Headline -->
+<div class="font-headline text-lg font-semibold tracking-tight text-slate-900 dark:text-slate-50">
+            HushWire
+        </div>
+<!-- Trailing Icon -->
+<button class="text-blue-600 dark:text-blue-400 hover:opacity-70 transition-opacity active:scale-95 transition-transform flex items-center justify-center min-h-[44px] min-w-[44px]">
+<span class="material-symbols-outlined">settings</span>
+</button>
+</header>
+<!-- Main Content Canvas -->
+<main class="pt-[env(safe-area-inset-top,0px)+44px] pb-[calc(48px+env(safe-area-inset-bottom,20px)+32px)] max-w-2xl mx-auto">
+<!-- Large Title Header Area -->
+<div class="px-4 pt-6 pb-2 flex justify-between items-end">
+<h1 class="text-3xl font-extrabold font-headline tracking-tight text-slate-900">配置</h1>
+<button class="text-blue-600 font-medium text-[15px] active:opacity-70 transition-opacity min-h-[44px] flex items-center">
+                导入 TOML
+            </button>
+</div>
+<!-- Active Profile Card -->
+<section class="mx-4 mt-2 mb-6">
+<div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200 flex items-center justify-between active:scale-[0.98] transition-transform cursor-pointer">
+<div class="flex items-center gap-4">
+<div class="h-10 w-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">public</span>
+</div>
+<div>
+<h2 class="text-[17px] font-semibold tracking-tight">台湾测试节点</h2>
+<p class="text-[13px] text-slate-500 mt-0.5">未连接，可编辑</p>
+</div>
+</div>
+<div class="text-blue-600 flex items-center justify-center">
+<span class="material-symbols-outlined text-[24px]" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</div>
+</div>
+</section>
+<!-- Network Policy Section -->
+<section class="mx-4 mb-6">
+<h3 class="text-[13px] font-medium text-slate-500 uppercase tracking-wider mb-2 px-1">网络策略</h3>
+<div class="bg-slate-200/80 p-0.5 rounded-[9px] flex items-center text-[13px] font-medium">
+<button class="flex-1 text-center py-1.5 bg-white rounded-md shadow-sm border border-black/5 text-slate-900 min-h-[32px]">
+                    指定地址
+                </button>
+<button class="flex-1 text-center py-1.5 text-slate-600 active:opacity-70 transition-opacity min-h-[32px]">
+                    自定义分流
+                </button>
+<button class="flex-1 text-center py-1.5 text-slate-600 active:opacity-70 transition-opacity min-h-[32px]">
+                    全局
+                </button>
+</div>
+<p class="text-[13px] text-slate-500 mt-2 px-1 leading-relaxed">
+                仅路由配置中的 <span class="font-mono text-[12px] bg-slate-200/50 px-1 rounded text-slate-700">/32</span> 地址；默认路由与 DNS 保持不变
+            </p>
+</section>
+<!-- Config Summary Section -->
+<section class="mx-4 mb-6">
+<h3 class="text-[13px] font-medium text-slate-500 uppercase tracking-wider mb-2 px-1">接口与路由详情</h3>
+<div class="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+<!-- Row 1 -->
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">接口地址</span>
+<span class="text-[14px] text-slate-500 font-mono">10.77.60.2/30</span>
+</div>
+<!-- Row 2 -->
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">Endpoint</span>
+<span class="text-[14px] text-slate-500 font-mono">154.40.60.58:27783</span>
+</div>
+<!-- Row 3 -->
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">传输</span>
+<span class="text-[14px] text-slate-500 font-mono">UDP</span>
+</div>
+<!-- Row 4 -->
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">MTU</span>
+<span class="text-[14px] text-slate-500 font-mono">1280</span>
+</div>
+<!-- Row 5 -->
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">Peer</span>
+<span class="text-[14px] text-slate-500 font-mono">1</span>
+</div>
+<!-- Row 6 -->
+<div class="flex flex-col py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<div class="flex justify-between items-center">
+<span class="text-[15px] text-slate-900">允许路由</span>
+<span class="text-[14px] text-slate-500 font-mono">10.77.60.1/32</span>
+</div>
+<button class="text-[13px] text-blue-600 text-left mt-1 w-fit active:opacity-70 transition-opacity">查看全部 1 条</button>
+</div>
+<!-- Row 7 -->
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">直连例外</span>
+<span class="text-[14px] text-slate-500">无</span>
+</div>
+<!-- Row 8 -->
+<div class="flex justify-between items-center py-3 px-4 min-h-[44px]">
+<span class="text-[15px] text-slate-900">DNS</span>
+<span class="text-[14px] text-slate-500">保持系统 DNS</span>
+</div>
+</div>
+</section>
+<!-- Secondary Section: Recovery & Keepalive -->
+<section class="mx-4 mb-6">
+<h3 class="text-[13px] font-medium text-slate-500 uppercase tracking-wider mb-2 px-1">恢复与保活</h3>
+<div class="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+<div class="flex justify-between items-center py-3 px-4 border-b border-slate-100 min-h-[44px]">
+<span class="text-[15px] text-slate-900">Keepalive</span>
+<span class="text-[14px] text-slate-500 font-mono">25s</span>
+</div>
+<div class="flex justify-between items-center py-3 px-4 min-h-[44px]">
+<span class="text-[15px] text-slate-900">Rebind</span>
+<span class="text-[14px] text-slate-500 font-mono">90s</span>
+</div>
+</div>
+</section>
+<!-- Validation Action -->
+<section class="mx-4 mt-8 mb-4">
+<button class="w-full bg-blue-50 text-blue-700 font-semibold text-[16px] rounded-xl py-3.5 min-h-[44px] flex items-center justify-center gap-2 active:scale-[0.98] transition-transform">
+<span class="material-symbols-outlined text-[18px]">verified_user</span>
+                验证配置
+            </button>
+<div class="text-center mt-2">
+<span class="text-[13px] text-teal-600 font-medium flex items-center justify-center gap-1">
+<span class="material-symbols-outlined text-[14px]" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+                    配置有效
+                </span>
+</div>
+</section>
+<!-- Privacy Note -->
+<div class="flex items-center justify-center gap-1.5 mx-4 mt-8 text-slate-400">
+<span class="material-symbols-outlined text-[14px]">lock</span>
+<p class="text-[12px]">私钥与预共享密钥已保存，但不会在界面中显示</p>
+</div>
+</main>
+<!-- BottomNavBar (Shared Component) -->
+<nav class="fixed bottom-0 left-0 w-full flex justify-around items-center h-12 px-6 pb-safe bg-white/90 dark:bg-black/90 backdrop-blur-lg border-t border-slate-200 dark:border-slate-800 z-50">
+<!-- Tab 1: 连接 (Inactive) -->
+<button class="flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-900 active:opacity-80 transition-all min-h-[44px] min-w-[44px] w-full">
+<span class="material-symbols-outlined text-[24px]">bolt</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">连接</span>
+</button>
+<!-- Tab 2: 配置 (Active - Semantic Match) -->
+<button class="flex flex-col items-center justify-center text-blue-600 dark:text-blue-400 hover:bg-slate-50 dark:hover:bg-slate-900 active:opacity-80 transition-all min-h-[44px] min-w-[44px] w-full">
+<span class="material-symbols-outlined text-[24px]" style="font-variation-settings: 'FILL' 1;">qr_code_2</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5 font-medium">配置</span>
+</button>
+<!-- Tab 3: 诊断 (Inactive) -->
+<button class="flex flex-col items-center justify-center text-slate-400 dark:text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-900 active:opacity-80 transition-all min-h-[44px] min-w-[44px] w-full">
+<span class="material-symbols-outlined text-[24px]">analytics</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">诊断</span>
+</button>
+</nav>
+</body></html>

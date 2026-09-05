@@ -50,6 +50,12 @@ impl PeerState {
     pub fn snapshot(&self) -> HashMap<String, PeerStats> {
         self.inner.lock().unwrap().clone()
     }
+
+    pub fn clear_endpoint(&self, peer_name: &str) {
+        if let Some(stats) = self.inner.lock().unwrap().get_mut(peer_name) {
+            stats.current_endpoint = None;
+        }
+    }
 }
 
 fn update_endpoint(peer_name: &str, stats: &mut PeerStats, source: SocketAddr) {

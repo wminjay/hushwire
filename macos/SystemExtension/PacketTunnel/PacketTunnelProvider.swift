@@ -1,10 +1,12 @@
 import Darwin
-import Foundation
+@preconcurrency import Foundation
 import HushWireCore
-import NetworkExtension
+@preconcurrency import NetworkExtension
 import os
 
-final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDelegate {
+final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDelegate,
+  @unchecked Sendable
+{
   private enum ProviderFailure {
     static func error(code: Int, description: String) -> Error {
       NSError(
@@ -15,13 +17,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     }
   }
 
+  /// Network Extension completion handlers are designed to be invoked
+  /// asynchronously but are not annotated `Sendable` in the imported API.
+  private final class CallbackBox<Input>: @unchecked Sendable {
+    private let callback: (Input) -> Void
+
+    init(_ callback: @escaping (Input) -> Void) {
+      self.callback = callback
+    }
+
+    func call(_ input: Input) {
+      callback(input)
+    }
+  }
+
   private struct PendingProtectedActivation {
     let settings: NEPacketTunnelNetworkSettings
     let plan: HushWireConfigurationPlan
-    let completionHandler: ((Data?) -> Void)?
+    let completionHandler: CallbackBox<Data?>?
+  }
+
+  private struct PendingEndpointRouteCleanup {
+    let peerName: String
+    let endpoint: HushWireEndpoint
+    let settings: NEPacketTunnelNetworkSettings
   }
 
   private let workQueue = DispatchQueue(label: "com.jamie.HushWire.PacketTunnel.provider")
+  private let endpointResolverQueue = DispatchQueue(
+    label: "com.jamie.HushWire.PacketTunnel.endpoint-resolver",
+    qos: .utility
+  )
   private let logger = Logger(subsystem: "com.jamie.HushWire", category: "PacketTunnel")
   private var core: HushWireCoreRuntime?
   private var transport: HushWireNetworkTransport?
@@ -35,7 +61,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
   private var networkPolicy = HushWireNetworkPolicy.hostRoutesOnly
   private var lastHandshakeDescription: String?
   private var activeConfiguration: Data?
-  private var duplicateConfigurationCompletionHandlers: [((Data?) -> Void)] = []
+  private var duplicateConfigurationCompletionHandlers: [CallbackBox<Data?>] = []
+  private var endpointRefreshInFlight = Set<String>()
+  private var lastEndpointRefreshAttempt: [String: DispatchTime] = [:]
+  private var pendingEndpointRouteCleanup: PendingEndpointRouteCleanup?
   private var awaitingConfiguration = false
   private var running = false
 
@@ -43,6 +72,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     options: [String: NSObject]?,
     completionHandler: @escaping (Error?) -> Void
   ) {
+    let completion = CallbackBox(completionHandler)
+    let fullTunnelApproved =
+      (options?[HushWireNetworkPolicy.fullTunnelApprovalOptionKey] as? NSNumber)?.boolValue == true
     workQueue.async { [weak self] in
       guard let self else { return }
       do {
@@ -51,23 +83,51 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
         }
         let providerConfiguration = try validatedProviderConfiguration()
         guard
-          providerConfiguration["configurationStorage"] as? String
-            == HushWireConfigurationStore.providerStorageKind
+          let configurationStorage =
+            providerConfiguration["configurationStorage"] as? String
         else {
           throw ProviderFailure.error(
             code: 2,
-            description: "VPN 配置尚未引用安全的 App Group 配置。请先在 HushWire 中导入 TOML。"
+            description: "VPN 配置尚未引用安全配置通道。请先在 HushWire 中导入 TOML。"
           )
         }
+        #if os(iOS)
+          guard
+            configurationStorage == HushWireConfigurationStore.providerStorageKind
+              || configurationStorage == HushWireConfigurationStore.legacyProviderStorageKind
+          else {
+            throw ProviderFailure.error(
+              code: 2,
+              description: "VPN 配置引用了不受支持的安全配置通道。请在 HushWire 中重新保存策略。"
+            )
+          }
+        #else
+          guard configurationStorage == HushWireConfigurationStore.providerStorageKind else {
+            throw ProviderFailure.error(
+              code: 2,
+              description: "VPN 配置引用了不受支持的安全配置通道。请在 HushWire 中重新保存配置。"
+            )
+          }
+        #endif
         let networkPolicy = try HushWireNetworkPolicy(
           providerConfiguration: providerConfiguration
         )
         let schemaVersion =
           (providerConfiguration["schemaVersion"] as? NSNumber)?.intValue
           ?? providerConfiguration["schemaVersion"] as? Int
-        guard let schemaVersion, schemaVersion == 2 || schemaVersion == 3 || schemaVersion == 4 else {
+        guard let schemaVersion, (2...5).contains(schemaVersion)
+        else {
           throw ProviderFailure.error(code: 3, description: "VPN 配置 schemaVersion 不受支持。")
         }
+        #if os(iOS)
+          let onDemandStartAuthorized =
+            schemaVersion >= 5
+            && (providerConfiguration[
+              HushWireConfigurationStore.onDemandStartAuthorizedKey
+            ] as? NSNumber)?.boolValue == true
+        #else
+          let onDemandStartAuthorized = false
+        #endif
         if networkPolicy.routePolicy == .fullTunnel {
           guard schemaVersion >= 3 else {
             throw ProviderFailure.error(
@@ -75,13 +135,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
               description: "默认隧道要求 schemaVersion 3 或更高版本，请重新保存 VPN 配置。"
             )
           }
-          guard
-            (options?[HushWireNetworkPolicy.fullTunnelApprovalOptionKey] as? NSNumber)?
-              .boolValue == true
-          else {
+          guard fullTunnelApproved || onDemandStartAuthorized else {
             throw ProviderFailure.error(
               code: 3,
-              description: "默认隧道启动缺少本次明确确认；请从 HushWire App 点击连接。"
+              description: "默认隧道启动既没有本次确认，也没有已保存的自动连接授权。"
             )
           }
         }
@@ -91,19 +148,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
             description: "自定义分流要求 schemaVersion 4，请重新保存 VPN 配置。"
           )
         }
-        // Secrets are intentionally not accepted in start options because
-        // macOS retains those options in diagnostic session state. Mark the
-        // provider connected without routes, then receive the configuration
-        // over the private provider-message channel.
         self.networkPolicy = networkPolicy
         awaitingConfiguration = true
+        #if os(iOS)
+          if configurationStorage == HushWireConfigurationStore.providerStorageKind {
+            guard schemaVersion >= 5 else {
+              throw ProviderFailure.error(
+                code: 3,
+                description: "共享 Keychain 自动启动要求 schemaVersion 5，请重新保存 VPN 配置。"
+              )
+            }
+            guard
+              let profileIDValue = providerConfiguration[
+                HushWireConfigurationStore.activeProfileIDKey
+              ] as? String,
+              let profileID = UUID(uuidString: profileIDValue)
+            else {
+              throw ProviderFailure.error(code: 2, description: "VPN 配置缺少有效的当前配置 ID。")
+            }
+            let configuration = try HushWireConfigurationStore.load(for: profileID)
+            logger.info(
+              "Packet Tunnel loaded its configuration from the shared Keychain; routePolicy=\(networkPolicy.routePolicy.rawValue, privacy: .public)"
+            )
+            completion.call(nil)
+            installConfiguration(configuration, completionHandler: nil)
+            return
+          }
+        #endif
+        // Legacy iOS and current macOS starts receive the TOML over a private
+        // provider-message channel. Secrets are never accepted in start options.
         scheduleConfigurationDeliveryTimeout()
         logger.info(
           "Packet Tunnel is waiting for private configuration delivery; routePolicy=\(networkPolicy.routePolicy.rawValue, privacy: .public)"
         )
-        completionHandler(nil)
+        completion.call(nil)
       } catch {
-        finishFailedStart(error, completionHandler: completionHandler)
+        finishFailedStart(error, completionHandler: completion)
       }
     }
   }
@@ -112,9 +192,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     with reason: NEProviderStopReason,
     completionHandler: @escaping () -> Void
   ) {
+    let completion = CallbackBox<Void> { _ in completionHandler() }
     workQueue.async { [weak self] in
       guard let self else {
-        completionHandler()
+        completion.call(())
         return
       }
       self.logger.info("Packet Tunnel stopping; reason=\(reason.rawValue)")
@@ -124,7 +205,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       // with nil while that teardown is already under way races the system on
       // macOS and can report a spurious "Device not configured" error even
       // though the routes and DNS have been removed successfully.
-      completionHandler()
+      completion.call(())
     }
   }
 
@@ -132,25 +213,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     _ messageData: Data,
     completionHandler: ((Data?) -> Void)?
   ) {
+    let completion = completionHandler.map { CallbackBox($0) }
     workQueue.async { [weak self] in
       guard let self else {
-        completionHandler?(nil)
+        completion?.call(nil)
         return
       }
       guard let command = messageData.first else {
-        completionHandler?(self.response(ok: false, error: "空的 provider message。"))
+        completion?.call(self.response(ok: false, error: "空的 provider message。"))
         return
       }
       switch command {
       case 0x01:
-        completionHandler?(self.statusResponse())
+        completion?.call(self.statusResponse())
       case 0x02:
         self.installConfiguration(
           Data(messageData.dropFirst()),
-          completionHandler: completionHandler
+          completionHandler: completion
         )
       default:
-        completionHandler?(self.response(ok: false, error: "未知的 provider message。"))
+        completion?.call(self.response(ok: false, error: "未知的 provider message。"))
       }
     }
   }
@@ -197,6 +279,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       guard let self, runtime === self.core else { return }
       self.lastHandshakeDescription = "\(peerName) · \(roleName) · \(endpoint.displayString)"
       self.activatePendingProtectedConfigurationIfNeeded(peerName: peerName)
+      self.finishEndpointRouteTransitionIfNeeded(peerName: peerName, endpoint: endpoint)
     }
   }
 
@@ -224,19 +307,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
 
   private func installConfiguration(
     _ configuration: Data,
-    completionHandler: ((Data?) -> Void)?
+    completionHandler: CallbackBox<Data?>?
   ) {
     do {
       if let activeConfiguration {
         guard activeConfiguration == configuration else {
-          completionHandler?(
-            response(ok: false, error: "隧道已使用另一份配置运行；请先断开再切换配置。")
+          finishFailedConfiguration(
+            ProviderFailure.error(
+              code: 9,
+              description: "收到与当前会话不一致的配置；隧道已安全停止，请重新连接。"
+            ),
+            completionHandler: completionHandler
           )
           return
         }
         if running {
           logger.info("Ignoring an identical duplicate configuration delivery")
-          completionHandler?(response(ok: true))
+          completionHandler?.call(response(ok: true))
         } else if let completionHandler {
           logger.info("Coalescing an identical configuration delivery during startup")
           duplicateConfigurationCompletionHandlers.append(completionHandler)
@@ -332,7 +419,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
   private func activateConfiguration(
     settings: NEPacketTunnelNetworkSettings,
     plan: HushWireConfigurationPlan,
-    completionHandler: ((Data?) -> Void)?,
+    completionHandler: CallbackBox<Data?>?,
     handshakeAlreadyStarted: Bool
   ) {
     setTunnelNetworkSettings(settings) { [weak self] error in
@@ -353,11 +440,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
           "Packet Tunnel configured; routePolicy=\(self.networkPolicy.routePolicy.rawValue, privacy: .public) includedRoutes=\(plan.includedRoutes.count) excludedRoutes=\(plan.excludedRoutes.count) dnsServers=\(plan.dnsServers.count)"
         )
         let successResponse = self.response(ok: true)
-        completionHandler?(successResponse)
+        completionHandler?.call(successResponse)
         let duplicateCompletions = self.duplicateConfigurationCompletionHandlers
         self.duplicateConfigurationCompletionHandlers = []
         for duplicateCompletion in duplicateCompletions {
-          duplicateCompletion(successResponse)
+          duplicateCompletion.call(successResponse)
         }
       }
     }
@@ -401,10 +488,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
   private func statusResponse() -> Data? {
     let statistics = (try? core?.peerStatistics()) ?? []
     let peers: [[String: Any]] = statistics.map { stats in
+      let route = routeMetadata.first(where: { $0.peerName == stats.peerName })
+      let recoveryTimeout =
+        route.flatMap { route in
+          interfaceMetadata.map {
+            endpointRecoveryTimeoutMilliseconds(route: route, transport: $0.transport)
+          }
+        } ?? 0
       var value: [String: Any] = [
         "name": stats.peerName,
         "txBytes": stats.txBytes,
         "rxBytes": stats.rxBytes,
+        "recoveryTimeoutMilliseconds": recoveryTimeout,
+        "isStale": recoveryTimeout > 0
+          && (stats.lastSeenMillisecondsAgo ?? 0) >= recoveryTimeout,
+        "endpointRefreshInFlight": endpointRefreshInFlight.contains(stats.peerName),
       ]
       if let lastSeen = stats.lastSeenMillisecondsAgo {
         value["lastSeenMillisecondsAgo"] = lastSeen
@@ -420,6 +518,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       "coreVersion": String(cString: hw_core_version_string()),
       "packetFlowEnabled": true,
       "awaitingConfiguration": awaitingConfiguration,
+      "configurationInstalled": activeConfiguration != nil,
       "running": running,
       "routePolicy": networkPolicy.routePolicy.rawValue,
       "dnsServers": networkPolicy.dnsServers,
@@ -442,9 +541,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
   private func makeNetworkSettings(
     interface: HushWireInterfaceMetadata,
     routes: [HushWireRouteMetadata],
-    plan: HushWireConfigurationPlan
+    plan: HushWireConfigurationPlan,
+    additionalExcludedRoutes: [HushWireIPv4RouteSpec] = []
   ) -> NEPacketTunnelNetworkSettings {
-    let tunnelEndpoint = routes.first { $0.routeKind == .included }?.endpoint.host
+    let tunnelEndpoint =
+      routes.first { $0.routeKind == .included }?.endpoint.host
       ?? routes[0].endpoint.host
     let settings = NEPacketTunnelNetworkSettings(
       tunnelRemoteAddress: tunnelEndpoint
@@ -461,7 +562,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     // Direct-route exclusions include configured excluded_ips and any
     // automatically protected endpoint whose address an included route would
     // otherwise capture.
-    ipv4.excludedRoutes = plan.excludedRoutes.map {
+    let excludedRoutes = Array(Set(plan.excludedRoutes + additionalExcludedRoutes)).sorted {
+      if $0.prefixLength != $1.prefixLength { return $0.prefixLength > $1.prefixLength }
+      return $0.network < $1.network
+    }
+    ipv4.excludedRoutes = excludedRoutes.map {
       NEIPv4Route(destinationAddress: $0.network, subnetMask: $0.subnetMask)
     }
     settings.ipv4Settings = ipv4
@@ -527,6 +632,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
       else { return }
       do {
         try core.tick()
+        self.refreshDynamicEndpointsIfNeeded(runtime: core)
       } catch {
         self.logger.error("Session maintenance failed: \(error.localizedDescription)")
       }
@@ -535,23 +641,228 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     timer.resume()
   }
 
+  private func refreshDynamicEndpointsIfNeeded(runtime: HushWireCoreRuntime) {
+    guard running, let transportKind = interfaceMetadata?.transport else { return }
+    let statistics = (try? runtime.peerStatistics()) ?? []
+    let statisticsByPeer = Dictionary(uniqueKeysWithValues: statistics.map { ($0.peerName, $0) })
+    var scheduledPeers = Set<String>()
+    let now = DispatchTime.now()
+
+    for route in routeMetadata {
+      guard
+        scheduledPeers.insert(route.peerName).inserted,
+        route.configuredEndpoint != route.endpoint.displayString,
+        let lastSeen = statisticsByPeer[route.peerName]?.lastSeenMillisecondsAgo
+      else { continue }
+      let timeout = endpointRecoveryTimeoutMilliseconds(route: route, transport: transportKind)
+      guard timeout > 0, lastSeen >= timeout else { continue }
+      guard !endpointRefreshInFlight.contains(route.peerName) else { continue }
+      if let lastAttempt = lastEndpointRefreshAttempt[route.peerName],
+        now.uptimeNanoseconds - lastAttempt.uptimeNanoseconds < 15_000_000_000
+      {
+        continue
+      }
+
+      endpointRefreshInFlight.insert(route.peerName)
+      lastEndpointRefreshAttempt[route.peerName] = now
+      resolveEndpoint(route.peerName, runtime: runtime)
+    }
+  }
+
+  private func resolveEndpoint(_ peerName: String, runtime: HushWireCoreRuntime) {
+    endpointResolverQueue.async { [weak self, weak runtime] in
+      guard let self, let runtime else { return }
+      do {
+        let endpoint = try runtime.resolvePeerEndpoint(peerName: peerName)
+        self.workQueue.async { [weak self, weak runtime] in
+          guard let self, let runtime else { return }
+          self.applyResolvedEndpoint(endpoint, peerName: peerName, runtime: runtime)
+        }
+      } catch {
+        let detail = error.localizedDescription
+        self.workQueue.async { [weak self] in
+          guard let self else { return }
+          self.endpointRefreshInFlight.remove(peerName)
+          self.logger.error(
+            "Could not refresh endpoint for \(peerName, privacy: .public): \(detail, privacy: .public)"
+          )
+        }
+      }
+    }
+  }
+
+  private func applyResolvedEndpoint(
+    _ endpoint: HushWireEndpoint,
+    peerName: String,
+    runtime: HushWireCoreRuntime
+  ) {
+    endpointRefreshInFlight.remove(peerName)
+    guard runtime === core, running, let interface = interfaceMetadata else { return }
+    guard let currentRoute = routeMetadata.first(where: { $0.peerName == peerName }) else { return }
+    guard currentRoute.endpoint != endpoint else { return }
+    guard peerIsStale(peerName, runtime: runtime) else { return }
+
+    do {
+      let updatedRoutes = routeMetadata.map { route in
+        route.peerName == peerName ? route.replacingEndpoint(endpoint) : route
+      }
+      let updatedPlan = try HushWireConfigurationPolicy.plan(
+        interface: interface,
+        routes: updatedRoutes,
+        networkPolicy: networkPolicy
+      )
+      let finalSettings = makeNetworkSettings(
+        interface: interface,
+        routes: updatedRoutes,
+        plan: updatedPlan
+      )
+
+      guard networkPolicy.routePolicy.requiresAuthenticatedPreflight else {
+        activateResolvedEndpoint(
+          endpoint,
+          peerName: peerName,
+          runtime: runtime,
+          routes: updatedRoutes,
+          finalSettings: nil
+        )
+        return
+      }
+
+      let oldEndpointException = HushWireIPv4RouteSpec(
+        network: currentRoute.endpoint.host,
+        prefixLength: 32
+      )
+      let transitionSettings = makeNetworkSettings(
+        interface: interface,
+        routes: updatedRoutes,
+        plan: updatedPlan,
+        additionalExcludedRoutes: [oldEndpointException]
+      )
+      setTunnelNetworkSettings(transitionSettings) { [weak self, weak runtime] error in
+        guard let self, let runtime else { return }
+        self.workQueue.async {
+          guard runtime === self.core, self.running else { return }
+          if let error {
+            self.logger.error(
+              "Could not protect refreshed endpoint route for \(peerName, privacy: .public): \(error.localizedDescription)"
+            )
+            return
+          }
+          self.activateResolvedEndpoint(
+            endpoint,
+            peerName: peerName,
+            runtime: runtime,
+            routes: updatedRoutes,
+            finalSettings: finalSettings
+          )
+        }
+      }
+    } catch {
+      logger.error(
+        "Rejected refreshed endpoint for \(peerName, privacy: .public): \(error.localizedDescription)"
+      )
+    }
+  }
+
+  private func activateResolvedEndpoint(
+    _ endpoint: HushWireEndpoint,
+    peerName: String,
+    runtime: HushWireCoreRuntime,
+    routes: [HushWireRouteMetadata],
+    finalSettings: NEPacketTunnelNetworkSettings?
+  ) {
+    do {
+      guard try runtime.updatePeerEndpoint(peerName: peerName, endpoint: endpoint) else { return }
+      routeMetadata = routes
+      if let finalSettings {
+        pendingEndpointRouteCleanup = PendingEndpointRouteCleanup(
+          peerName: peerName,
+          endpoint: endpoint,
+          settings: finalSettings
+        )
+      }
+      guard transport?.reset() == true else {
+        throw ProviderFailure.error(code: 13, description: "transport 已停止。")
+      }
+      try runtime.initiateHandshake(peerName: peerName)
+      logger.notice(
+        "Peer endpoint changed after DNS refresh; peer=\(peerName, privacy: .public) endpoint=\(endpoint.displayString, privacy: .public)"
+      )
+    } catch {
+      logger.error(
+        "Could not activate refreshed endpoint for \(peerName, privacy: .public): \(error.localizedDescription)"
+      )
+    }
+  }
+
+  private func finishEndpointRouteTransitionIfNeeded(
+    peerName: String,
+    endpoint: HushWireEndpoint
+  ) {
+    guard
+      let pending = pendingEndpointRouteCleanup,
+      pending.peerName == peerName,
+      pending.endpoint == endpoint
+    else { return }
+    pendingEndpointRouteCleanup = nil
+    setTunnelNetworkSettings(pending.settings) { [weak self] error in
+      if let error {
+        self?.logger.error(
+          "Could not remove previous endpoint route exception: \(error.localizedDescription)"
+        )
+      } else {
+        self?.logger.info("Removed previous endpoint route exception after authenticated recovery")
+      }
+    }
+  }
+
+  private func peerIsStale(_ peerName: String, runtime: HushWireCoreRuntime) -> Bool {
+    guard
+      let route = routeMetadata.first(where: { $0.peerName == peerName }),
+      let transportKind = interfaceMetadata?.transport,
+      let lastSeen = try? runtime.peerStatistics().first(where: { $0.peerName == peerName })?
+        .lastSeenMillisecondsAgo
+    else { return false }
+    let timeout = endpointRecoveryTimeoutMilliseconds(route: route, transport: transportKind)
+    return timeout > 0 && lastSeen >= timeout
+  }
+
+  private func endpointRecoveryTimeoutMilliseconds(
+    route: HushWireRouteMetadata,
+    transport: HushWireTransportKind
+  ) -> UInt64 {
+    switch transport {
+    case .udp: UInt64(route.udpRebindAfter) * 1_000
+    case .tcp: route.sessionTimeout * 1_000
+    }
+  }
+
   private func finishFailedStart(
     _ error: Error,
-    completionHandler: @escaping (Error?) -> Void
+    completionHandler: CallbackBox<Error?>
   ) {
-    logger.error("Packet Tunnel failed to start: \(error.localizedDescription)")
+    let safeError = sanitizedProviderError(error)
+    logger.error("Packet Tunnel failed to start: \(safeError.localizedDescription)")
     tearDownRuntime()
-    completionHandler(error)
+    completionHandler.call(safeError)
   }
 
   private func finishFailedConfiguration(
     _ error: Error,
-    completionHandler: ((Data?) -> Void)?
+    completionHandler: CallbackBox<Data?>?
   ) {
-    logger.error("Packet Tunnel configuration failed: \(error.localizedDescription)")
+    let safeError = sanitizedProviderError(error)
+    logger.error("Packet Tunnel configuration failed: \(safeError.localizedDescription)")
     tearDownRuntime()
-    completionHandler?(response(ok: false, error: error.localizedDescription))
-    cancelTunnelWithError(error)
+    completionHandler?.call(response(ok: false, error: safeError.localizedDescription))
+    cancelTunnelWithError(safeError)
+  }
+
+  private func sanitizedProviderError(_ error: Error) -> Error {
+    ProviderFailure.error(
+      code: (error as NSError).code,
+      description: HushWireRedactor.redact(error.localizedDescription)
+    )
   }
 
   private func tearDownRuntime() {
@@ -582,11 +893,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, HushWireCoreRuntimeDel
     lastHandshakeDescription = nil
     activeConfiguration = nil
     let stoppedResponse = response(ok: false, error: "隧道在认证预握手期间停止。")
-    pendingCompletion?(stoppedResponse)
+    pendingCompletion?.call(stoppedResponse)
     let duplicateCompletions = duplicateConfigurationCompletionHandlers
     duplicateConfigurationCompletionHandlers = []
     for duplicateCompletion in duplicateCompletions {
-      duplicateCompletion(stoppedResponse)
+      duplicateCompletion.call(stoppedResponse)
     }
+    endpointRefreshInFlight.removeAll()
+    lastEndpointRefreshAttempt.removeAll()
+    pendingEndpointRouteCleanup = nil
   }
 }

@@ -116,7 +116,7 @@ struct HushWireNetworkPolicy: Equatable, Sendable {
   }
 }
 
-struct HushWireIPv4RouteSpec: Equatable, Sendable {
+struct HushWireIPv4RouteSpec: Equatable, Hashable, Sendable {
   let network: String
   let prefixLength: UInt8
 
@@ -201,8 +201,8 @@ struct HushWireConfigurationPlan: Equatable {
   /// Routes rendered into `NEIPv4Settings`.
   ///
   /// Keep `0.0.0.0/0` in the semantic plan and in the HushWire core, but
-  /// express it to macOS as the equivalent pair of /1 routes. A directly
-  /// installed default route can appear in the macOS routing table while
+  /// express it to Apple Packet Tunnel platforms as the equivalent pair of /1
+  /// routes. A directly installed default route can appear in the routing table while
   /// sends through a /32-addressed packet tunnel still fail with
   /// `EHOSTUNREACH`. The two /1 routes avoid that special default-route path
   /// without changing configured allowed/excluded-prefix precedence.
@@ -253,7 +253,7 @@ enum HushWireConfigurationPolicy {
       throw HushWireCoreError.operation("配置没有 Peer 路由。")
     }
     guard interface.listen.port == 0 else {
-      throw HushWireCoreError.operation("当前 macOS 客户端要求 interface.listen 使用端口 0。")
+      throw HushWireCoreError.operation("当前 Packet Tunnel 客户端要求 interface.listen 使用端口 0。")
     }
     guard routes.allSatisfy({ $0.endpoint.port != 0 && !$0.endpoint.host.isEmpty }) else {
       throw HushWireCoreError.operation("Peer endpoint 无效。")
@@ -477,16 +477,20 @@ enum HushWireConfigurationPolicy {
     includedRoutes: [HushWireIPv4RouteSpec],
     excludedRoutes: [HushWireIPv4RouteSpec]
   ) -> Bool {
-    guard let includedPrefixLength = includedRoutes
-      .filter({ $0.contains(address) })
-      .map(\.prefixLength)
-      .max()
+    guard
+      let includedPrefixLength =
+        includedRoutes
+        .filter({ $0.contains(address) })
+        .map(\.prefixLength)
+        .max()
     else { return false }
-    let excludedPrefixLength = excludedRoutes
+    let excludedPrefixLength =
+      excludedRoutes
       .filter { $0.contains(address) }
       .map(\.prefixLength)
       .max()
-    return excludedPrefixLength
+    return
+      excludedPrefixLength
       .map { includedPrefixLength > $0 }
       ?? true
   }

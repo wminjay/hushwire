@@ -9,7 +9,8 @@ final class HushWireNetworkTransport: @unchecked Sendable {
   typealias FrameHandler = @Sendable (Data, HushWireEndpoint) -> Void
   typealias EventHandler = @Sendable (String) -> Void
 
-  private final class ConnectionState {
+  /// Every mutable member is accessed only from `queue`.
+  private final class ConnectionState: @unchecked Sendable {
     let connection: NWConnection
     let endpoint: HushWireEndpoint
     var tcpReadBuffer = Data()
@@ -65,16 +66,14 @@ final class HushWireNetworkTransport: @unchecked Sendable {
         contentContext: .defaultMessage,
         isComplete: true,
         completion: .contentProcessed { [weak self, weak state] error in
-          guard let self else {
+          guard let self, let state else {
             completion(false)
             return
           }
           self.queue.async {
             if let error {
               self.eventHandler("向 \(endpoint.displayString) 发送失败：\(error.localizedDescription)")
-              if let state {
-                self.remove(state)
-              }
+              self.remove(state)
               completion(false)
             } else {
               completion(true)
@@ -90,10 +89,19 @@ final class HushWireNetworkTransport: @unchecked Sendable {
   func rebindUDP() -> Bool {
     queue.sync {
       guard running, mode == .udp else { return false }
-      let oldConnections = Array(connections.values)
-      connections.removeAll()
-      oldConnections.forEach { $0.connection.cancel() }
+      resetConnections()
       eventHandler("UDP transport 已切换到新的本地流。")
+      return true
+    }
+  }
+
+  /// Cancel active flows for either transport. The next core send creates a
+  /// connection to the newly resolved endpoint.
+  func reset() -> Bool {
+    queue.sync {
+      guard running else { return false }
+      resetConnections()
+      eventHandler("transport 已切换到重新解析的 Peer endpoint。")
       return true
     }
   }
@@ -104,7 +112,9 @@ final class HushWireNetworkTransport: @unchecked Sendable {
       running = false
       let oldConnections = Array(connections.values)
       connections.removeAll()
-      oldConnections.forEach { $0.connection.cancel() }
+      for state in oldConnections {
+        state.connection.cancel()
+      }
     }
   }
 
@@ -217,6 +227,14 @@ final class HushWireNetworkTransport: @unchecked Sendable {
     guard connections[state.endpoint] === state else { return }
     connections.removeValue(forKey: state.endpoint)
     state.connection.cancel()
+  }
+
+  private func resetConnections() {
+    let oldConnections = Array(connections.values)
+    connections.removeAll()
+    for state in oldConnections {
+      state.connection.cancel()
+    }
   }
 
   private static func tcpFrame(_ frame: Data) -> Data {

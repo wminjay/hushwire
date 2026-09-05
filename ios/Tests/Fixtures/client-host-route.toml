@@ -1,0 +1,15 @@
+[interface]
+name = "hushwire-ios-test"
+address = "10.77.99.2/30"
+listen = "0.0.0.0:0"
+transport = "tcp"
+mtu = 1280
+private_key = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
+
+[[peer]]
+name = "documentation-peer"
+endpoint = "192.0.2.10:27777"
+allowed_ips = ["10.77.99.1/32"]
+psk = "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M="
+public_key = "REREREREREREREREREREREREREREREREREREREREREQ="
+persistent_keepalive = 5

@@ -88,9 +88,10 @@ pub struct PeerConfig {
 /// A configured peer endpoint whose host may be an IP literal or DNS name.
 ///
 /// Parsing configuration deliberately performs no network I/O. The router
-/// resolves DNS names once while creating a runtime, before any tunnel routes
-/// or DNS settings are installed. Creating a new runtime (including a normal
-/// macOS reconnect) therefore refreshes a dynamic-DNS endpoint.
+/// resolves DNS names while creating a runtime, before any tunnel routes or
+/// DNS settings are installed. Platform adapters may later re-resolve a name
+/// after a liveness timeout, protect the new physical route, and atomically
+/// apply the refreshed endpoint through the runtime API.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PeerEndpoint {
     host: String,

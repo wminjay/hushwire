@@ -98,6 +98,20 @@ struct HushWireRouteMetadata: Sendable {
       ? endpoint.displayString
       : "\(configuredEndpoint) → \(endpoint.displayString)"
   }
+
+  func replacingEndpoint(_ endpoint: HushWireEndpoint) -> Self {
+    Self(
+      peerName: peerName,
+      networkBytes: networkBytes,
+      prefixLength: prefixLength,
+      routeKind: routeKind,
+      configuredEndpoint: configuredEndpoint,
+      endpoint: endpoint,
+      persistentKeepalive: persistentKeepalive,
+      udpRebindAfter: udpRebindAfter,
+      sessionTimeout: sessionTimeout
+    )
+  }
 }
 
 struct HushWirePeerStatistics: Sendable {
@@ -149,7 +163,7 @@ extension HushWireCoreRuntimeDelegate {
   ) -> Bool { false }
 }
 
-final class HushWireCoreRuntime {
+final class HushWireCoreRuntime: @unchecked Sendable {
   weak var delegate: HushWireCoreRuntimeDelegate?
 
   private var handle: OpaquePointer?
@@ -214,6 +228,37 @@ final class HushWireCoreRuntime {
     try withPeerName(peerName, operation: "发起握手") { handle, bytes, error in
       hw_runtime_initiate_handshake(handle, bytes.baseAddress, bytes.count, error)
     }
+  }
+
+  func resolvePeerEndpoint(peerName: String) throws -> HushWireEndpoint {
+    var endpoint = HWEndpoint()
+    try withPeerName(peerName, operation: "重新解析 Peer endpoint") {
+      handle, bytes, error in
+      hw_runtime_resolve_peer_endpoint(
+        handle,
+        bytes.baseAddress,
+        bytes.count,
+        &endpoint,
+        error
+      )
+    }
+    return HushWireEndpoint(endpoint)
+  }
+
+  func updatePeerEndpoint(peerName: String, endpoint: HushWireEndpoint) throws -> Bool {
+    var value = endpoint.ffiValue
+    var changed: UInt8 = 0
+    try withPeerName(peerName, operation: "更新 Peer endpoint") { handle, bytes, error in
+      hw_runtime_update_peer_endpoint(
+        handle,
+        bytes.baseAddress,
+        bytes.count,
+        &value,
+        &changed,
+        error
+      )
+    }
+    return changed != 0
   }
 
   func submitOutboundIP(_ packet: Data) throws {
@@ -345,11 +390,12 @@ final class HushWireCoreRuntime {
   }
 
   private static func message(from error: inout HWError) -> String {
-    withUnsafePointer(to: &error.message) { pointer in
+    let message = withUnsafePointer(to: &error.message) { pointer in
       pointer.withMemoryRebound(to: CChar.self, capacity: Int(HW_ERROR_MESSAGE_CAPACITY)) {
         String(cString: $0)
       }
     }
+    return HushWireRedactor.redact(message)
   }
 }
 
@@ -491,8 +537,8 @@ private func hushWireVisitPeerStats(
   )
 }
 
-private extension HushWireEndpoint {
-  var ffiValue: HWEndpoint {
+extension HushWireEndpoint {
+  fileprivate var ffiValue: HWEndpoint {
     var value = HWEndpoint()
     value.family = family
     value.port = port

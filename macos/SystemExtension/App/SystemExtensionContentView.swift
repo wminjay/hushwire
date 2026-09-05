@@ -186,7 +186,8 @@ struct SystemExtensionContentView: View {
                         .font(.system(.body, design: .monospaced))
                     }
                     GridRow {
-                      Text(peer.lastSeenDescription).foregroundStyle(.secondary)
+                      Text(peer.healthDescription)
+                        .foregroundStyle(peer.isStale ? .orange : .secondary)
                       Text(peer.trafficDescription).foregroundStyle(.secondary)
                     }
                   }

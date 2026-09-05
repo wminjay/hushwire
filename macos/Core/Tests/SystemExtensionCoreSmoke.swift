@@ -372,6 +372,13 @@ enum SystemExtensionCoreSmoke {
     )
 
     try runtime.start()
+    let refreshedEndpoint = try runtime.resolvePeerEndpoint(peerName: "smoke-peer")
+    precondition(refreshedEndpoint.displayString == "192.0.2.10:27777")
+    let endpointChanged = try runtime.updatePeerEndpoint(
+      peerName: "smoke-peer",
+      endpoint: refreshedEndpoint
+    )
+    precondition(endpointChanged == false)
     try runtime.initiateHandshake(peerName: "smoke-peer")
     try runtime.tick()
     try runtime.stop()

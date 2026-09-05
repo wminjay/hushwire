@@ -33,6 +33,9 @@ struct HushWirePeerStatus: Identifiable, Equatable {
   let rxBytes: UInt64
   let lastSeenMillisecondsAgo: UInt64?
   let endpoint: String?
+  let recoveryTimeoutMilliseconds: UInt64
+  let isStale: Bool
+  let endpointRefreshInFlight: Bool
 
   var lastSeenDescription: String {
     guard let milliseconds = lastSeenMillisecondsAgo else { return "从未收到认证流量" }
@@ -45,6 +48,12 @@ struct HushWirePeerStatus: Identifiable, Equatable {
     formatter.countStyle = .binary
     return "↑ \(formatter.string(fromByteCount: Int64(clamping: txBytes)))  "
       + "↓ \(formatter.string(fromByteCount: Int64(clamping: rxBytes)))"
+  }
+
+  var healthDescription: String {
+    if endpointRefreshInFlight { return "对端失联，正在更新 endpoint" }
+    if isStale { return "对端失联，正在恢复" }
+    return lastSeenDescription
   }
 }
 
@@ -129,7 +138,14 @@ final class SystemExtensionController: NSObject, ObservableObject {
     case .invalid: "未配置"
     case .disconnected: "未连接"
     case .connecting: "正在连接"
-    case .connected: providerReady ? "已连接（隧道就绪）" : "已连接（正在配置）"
+    case .connected:
+      if !providerReady {
+        "已连接（正在配置）"
+      } else if peerStatuses.contains(where: \.isStale) {
+        "已连接（对端失联，正在恢复）"
+      } else {
+        "已连接（隧道就绪）"
+      }
     case .reasserting: "正在恢复"
     case .disconnecting: "正在断开"
     @unknown default: "未知状态"
@@ -344,6 +360,7 @@ final class SystemExtensionController: NSObject, ObservableObject {
     let becameReady = running && !providerReady
     providerReady = running
     lastHandshake = object["lastHandshake"] as? String ?? ""
+    let wasStale = peerStatuses.contains(where: \.isStale)
     let peerObjects = object["peers"] as? [[String: Any]] ?? []
     peerStatuses = peerObjects.compactMap { peer in
       guard let name = peer["name"] as? String else { return nil }
@@ -352,14 +369,22 @@ final class SystemExtensionController: NSObject, ObservableObject {
         txBytes: Self.uint64(peer["txBytes"]),
         rxBytes: Self.uint64(peer["rxBytes"]),
         lastSeenMillisecondsAgo: peer["lastSeenMillisecondsAgo"].map(Self.uint64),
-        endpoint: peer["endpoint"] as? String
+        endpoint: peer["endpoint"] as? String,
+        recoveryTimeoutMilliseconds: Self.uint64(peer["recoveryTimeoutMilliseconds"]),
+        isStale: (peer["isStale"] as? NSNumber)?.boolValue ?? false,
+        endpointRefreshInFlight: (peer["endpointRefreshInFlight"] as? NSNumber)?.boolValue ?? false
       )
     }
+    let isStale = peerStatuses.contains(where: \.isStale)
     if recoveredFromAnotherWindow {
       awaitingExternalConfigurationConfirmation = false
       updateReadyActivity(prefix: "检测到隧道已由另一个 HushWire 窗口完成配置。")
     } else if becameReady {
       updateReadyActivity()
+    } else if providerReady, isStale, !wasStale {
+      activity = "隧道接口仍在，但对端认证已超时；正在重新解析 endpoint 并恢复连接。"
+    } else if providerReady, !isStale, wasStale {
+      updateReadyActivity(prefix: "对端连接已恢复。")
     }
     if awaitingConfiguration && !running {
       deliverConfigurationIfNeeded()

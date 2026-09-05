@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+
+<html class="light" lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" name="viewport"/>
+<title>HushWire - Full Tunnel Confirmation</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    fontFamily: {
+                        headline: ["Inter", "sans-serif"],
+                        display: ["Inter", "sans-serif"],
+                        body: ["Inter", "sans-serif"],
+                        label: ["Inter", "sans-serif"]
+                    },
+                    colors: {
+                        brand: {
+                            50: '#f0f9ff',
+                            100: '#e0f2fe',
+                            500: '#0ea5e9',
+                            600: '#0284c7',
+                            900: '#0c4a6e',
+                        },
+                        amber: {
+                            100: '#fef3c7',
+                            600: '#d97706',
+                        },
+                        slate: {
+                            50: '#f8fafc',
+                            100: '#f1f5f9',
+                            200: '#e2e8f0',
+                            400: '#94a3b8',
+                            500: '#64748b',
+                            600: '#475569',
+                            900: '#0f172a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f8fafc; /* Near-white canvas */
+            -webkit-font-smoothing: antialiased;
+            overscroll-behavior-y: none;
+        }
+
+        /* iOS-like safe area padding */
+        .pb-safe { padding-bottom: env(safe-area-inset-bottom, 20px); }
+        .pt-safe { padding-top: env(safe-area-inset-top, 44px); }
+
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+
+        /* Bottom sheet animation */
+        @keyframes slideUp {
+            from { transform: translateY(100%); }
+            to { transform: translateY(0); }
+        }
+        .animate-slide-up {
+            animation: slideUp 0.3s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        .animate-fade-in {
+            animation: fadeIn 0.2s ease-out forwards;
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="h-screen w-screen overflow-hidden relative text-slate-900">
+<!-- Background App View (Blurred & Dimmed) -->
+<div class="absolute inset-0 z-0 flex flex-col pt-safe blur-[4px] brightness-75 transition-all duration-300">
+<!-- Top App Bar (From JSON) -->
+<header class="fixed top-0 w-full z-10 bg-white/80 backdrop-blur-md border-b border-slate-200 flex justify-between items-center px-4 h-11 pt-safe">
+<div class="flex items-center gap-3">
+<span class="material-symbols-outlined text-slate-900" style="font-variation-settings: 'FILL' 1;">account_circle</span>
+</div>
+<h1 class="text-xl font-headline font-bold text-slate-900 tracking-tight">HushWire</h1>
+<div class="flex items-center">
+<span class="material-symbols-outlined text-slate-600 hover:opacity-70 transition-opacity active:scale-95">settings</span>
+</div>
+</header>
+<!-- Main Content Area -->
+<main class="flex-1 mt-11 flex flex-col items-center justify-center px-6 gap-8">
+<!-- Profile Selector -->
+<button class="flex items-center justify-between w-full max-w-sm bg-white rounded-xl p-4 shadow-sm border border-slate-100 active:scale-[0.98] transition-transform">
+<div class="flex items-center gap-3">
+<div class="bg-brand-50 p-2 rounded-lg">
+<span class="material-symbols-outlined text-brand-600">public</span>
+</div>
+<div class="flex flex-col items-start">
+<span class="text-sm font-medium text-slate-900">台湾测试节点</span>
+<span class="text-xs text-slate-500 font-mono">172.16.0.2 • UDP</span>
+</div>
+</div>
+<span class="material-symbols-outlined text-slate-400">unfold_more</span>
+</button>
+<!-- Central Shield (Disconnected State) -->
+<div class="relative flex flex-col items-center justify-center py-8">
+<div class="w-48 h-48 rounded-full border-4 border-slate-200 flex items-center justify-center bg-white shadow-sm relative z-10">
+<span class="material-symbols-outlined text-6xl text-slate-300" style="font-variation-settings: 'FILL' 1;">shield</span>
+</div>
+<!-- Status Text -->
+<div class="mt-6 flex flex-col items-center">
+<h2 class="text-2xl font-bold text-slate-900">未连接</h2>
+<p class="text-sm text-slate-500 mt-1">Ready to connect</p>
+</div>
+</div>
+<!-- Network Impact Badge (Amber for Full Tunnel) -->
+<div class="bg-amber-100/50 border border-amber-200 rounded-lg p-3 flex items-start gap-3 w-full max-w-sm">
+<span class="material-symbols-outlined text-amber-600 mt-0.5">warning</span>
+<div class="flex flex-col">
+<span class="text-sm font-semibold text-amber-900">全局模式</span>
+<span class="text-xs text-amber-700/80 mt-0.5">IPv4 默认流量将经过 HushWire</span>
+</div>
+</div>
+<!-- Main Connect Button (Obscured but visible in background) -->
+<div class="w-full max-w-sm mt-4">
+<button class="w-full bg-brand-600 text-white rounded-xl py-4 font-semibold text-lg shadow-md hover:bg-brand-500 active:bg-brand-900 transition-colors h-[56px] flex items-center justify-center gap-2">
+<span class="material-symbols-outlined">power_settings_new</span>
+                    连接
+                </button>
+</div>
+</main>
+<!-- Bottom Nav Bar (From JSON, hidden for bottom sheet but rendered in bg) -->
+<nav class="fixed bottom-0 left-0 w-full bg-white/90 backdrop-blur-lg border-t border-slate-200 flex justify-around items-center h-12 px-6 pb-safe z-10">
+<button class="flex flex-col items-center justify-center text-brand-600 w-16 hover:bg-slate-50 active:opacity-80 transition-all rounded-lg h-full">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">bolt</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">连接</span>
+</button>
+<button class="flex flex-col items-center justify-center text-slate-400 w-16 hover:bg-slate-50 active:opacity-80 transition-all rounded-lg h-full">
+<span class="material-symbols-outlined">qr_code_2</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">配置</span>
+</button>
+<button class="flex flex-col items-center justify-center text-slate-400 w-16 hover:bg-slate-50 active:opacity-80 transition-all rounded-lg h-full">
+<span class="material-symbols-outlined">analytics</span>
+<span class="font-label text-[10px] uppercase tracking-wider mt-0.5">诊断</span>
+</button>
+</nav>
+</div>
+<!-- Backdrop Overlay (Catches taps to dismiss, though technically we just want the UI state here) -->
+<div aria-hidden="true" class="absolute inset-0 bg-slate-900/40 z-40 animate-fade-in"></div>
+<!-- Bottom Confirmation Sheet -->
+<div class="absolute bottom-0 w-full bg-white rounded-t-3xl shadow-[0_-8px_30px_rgb(0,0,0,0.12)] z-50 animate-slide-up pb-safe flex flex-col max-h-[751px]">
+<!-- Drag Indicator -->
+<div class="w-full flex justify-center pt-3 pb-2">
+<div class="w-10 h-1.5 bg-slate-300 rounded-full"></div>
+</div>
+<!-- Sheet Header -->
+<div class="px-6 pb-4 pt-2 text-center border-b border-slate-100">
+<h2 class="text-xl font-semibold text-slate-900 font-headline">连接并接管 IPv4 流量？</h2>
+<p class="text-sm text-slate-500 mt-2 leading-relaxed max-w-xs mx-auto">认证成功后才会修改路由；连接失败时保持当前网络不变.</p>
+</div>
+<!-- Impact List (Scrollable if needed) -->
+<div class="px-6 py-5 flex flex-col gap-4 overflow-y-auto">
+<!-- Row 1 -->
+<div class="flex items-center gap-4">
+<div class="w-10 h-10 rounded-full bg-brand-50 flex items-center justify-center flex-shrink-0">
+<span class="material-symbols-outlined text-brand-600">router</span>
+</div>
+<div class="flex-1">
+<span class="text-[15px] font-medium text-slate-800">默认路由 — 通过 HushWire</span>
+</div>
+</div>
+<!-- Row 2 -->
+<div class="flex items-center gap-4">
+<div class="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0">
+<span class="material-symbols-outlined text-slate-600">dns</span>
+</div>
+<div class="flex-1">
+<span class="text-[15px] font-medium text-slate-800">DNS — 1.1.1.1, 1.0.0.1</span>
+</div>
+</div>
+<!-- Row 3 -->
+<div class="flex items-center gap-4">
+<div class="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0">
+<span class="material-symbols-outlined text-slate-600">route</span>
+</div>
+<div class="flex-1 flex flex-col justify-center">
+<span class="text-[15px] font-medium text-slate-800">直连 — Peer Endpoint 与 2 条例外</span>
+</div>
+</div>
+<!-- Safety Note -->
+<div class="mt-2 text-center">
+<span class="text-xs text-slate-400 font-medium">断开后 iOS 会恢复原路由与 DNS.</span>
+</div>
+</div>
+<!-- Actions -->
+<div class="px-6 pb-6 pt-2 flex flex-col gap-3 mt-auto">
+<button class="w-full bg-brand-600 text-white rounded-xl font-semibold text-[17px] active:bg-brand-900 transition-colors h-[48px] flex items-center justify-center shadow-sm">
+                确认并连接
+            </button>
+<button class="w-full bg-transparent text-slate-500 rounded-xl font-semibold text-[17px] active:bg-slate-100 transition-colors h-[48px] flex items-center justify-center">
+                取消
+            </button>
+</div>
+</div>
+</body></html>

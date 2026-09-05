@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define HW_CORE_ABI_VERSION 2u
+#define HW_CORE_ABI_VERSION 3u
 #define HW_ERROR_MESSAGE_CAPACITY 512u
 
 typedef int32_t HWStatus;
@@ -183,6 +183,21 @@ HWStatus hw_runtime_invalidate_peer(
     const uint8_t *peer_name,
     size_t peer_name_length,
     uint8_t *invalidated,
+    HWError *error);
+
+HWStatus hw_runtime_resolve_peer_endpoint(
+    HWRuntime *runtime,
+    const uint8_t *peer_name,
+    size_t peer_name_length,
+    HWEndpoint *output,
+    HWError *error);
+
+HWStatus hw_runtime_update_peer_endpoint(
+    HWRuntime *runtime,
+    const uint8_t *peer_name,
+    size_t peer_name_length,
+    const HWEndpoint *endpoint,
+    uint8_t *changed,
     HWError *error);
 
 HWStatus hw_runtime_record_transport_sent(

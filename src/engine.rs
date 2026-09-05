@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -485,6 +485,8 @@ pub enum EngineError {
     Noise(#[from] noise::NoiseError),
     #[error("unknown peer: {0}")]
     UnknownPeer(String),
+    #[error("invalid peer endpoint: {0}")]
+    InvalidPeerEndpoint(SocketAddr),
 }
 
 /// Platform-independent HushWire packet engine.
@@ -499,6 +501,7 @@ pub struct Engine {
     local_static: Arc<StaticSecret>,
     sessions: Arc<SessionManager>,
     peers: PeerState,
+    resolved_endpoints: Arc<RwLock<HashMap<String, SocketAddr>>>,
 }
 
 impl Engine {
@@ -519,6 +522,7 @@ impl Engine {
             local_static: Arc::new(StaticSecret::from(local_static)),
             sessions: Arc::new(SessionManager::new()),
             peers: PeerState::new(),
+            resolved_endpoints: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -735,6 +739,37 @@ impl Engine {
         self.sessions.invalidate_peer(peer_name)
     }
 
+    /// Replace the last DNS resolution for a configured peer.
+    ///
+    /// Authenticated roaming state takes precedence during normal operation.
+    /// When DNS identifies a different endpoint, that learned address and the
+    /// cryptographic session are stale together, so both are cleared before
+    /// the adapter starts a replacement handshake.
+    pub fn update_resolved_endpoint(
+        &self,
+        peer_name: &str,
+        endpoint: SocketAddr,
+    ) -> Result<bool, EngineError> {
+        if !usable_peer_endpoint(endpoint) {
+            return Err(EngineError::InvalidPeerEndpoint(endpoint));
+        }
+        let peer = self
+            .peer(peer_name)
+            .ok_or_else(|| EngineError::UnknownPeer(peer_name.to_string()))?;
+        let previous = self.configured_endpoint(peer);
+        if previous == endpoint {
+            return Ok(false);
+        }
+
+        self.resolved_endpoints
+            .write()
+            .unwrap()
+            .insert(peer_name.to_string(), endpoint);
+        self.peers.clear_endpoint(peer_name);
+        self.sessions.invalidate_peer(peer_name);
+        Ok(true)
+    }
+
     /// Start or retry a handshake for a named peer.
     pub fn initiate_handshake(
         &self,
@@ -855,7 +890,17 @@ impl Engine {
             .get(&peer.name)
             .and_then(|stats| stats.current_endpoint)
             .filter(|endpoint| usable_peer_endpoint(*endpoint))
-            .or_else(|| usable_peer_endpoint(peer.endpoint).then_some(peer.endpoint))
+            .or_else(|| Some(self.configured_endpoint(peer)))
+            .filter(|endpoint| usable_peer_endpoint(*endpoint))
+    }
+
+    fn configured_endpoint(&self, peer: &Peer) -> SocketAddr {
+        self.resolved_endpoints
+            .read()
+            .unwrap()
+            .get(&peer.name)
+            .copied()
+            .unwrap_or(peer.endpoint)
     }
 }
 
@@ -1095,5 +1140,42 @@ mod engine_tests {
             Err(EngineError::Packet(PacketError::NotIpv4(6)))
         ));
         assert!(engine.peer_stats().is_empty());
+    }
+
+    #[test]
+    fn endpoint_update_replaces_pending_handshake_destination() {
+        let private_a = [0x51; 32];
+        let private_b = [0x52; 32];
+        let public_b = PublicKey::from(&StaticSecret::from(private_b)).to_bytes();
+        let old_endpoint: SocketAddr = "127.0.0.1:31202".parse().unwrap();
+        let new_endpoint: SocketAddr = "127.0.0.2:31202".parse().unwrap();
+        let engine = Engine::new(&config(TestConfig {
+            name: "memory-a",
+            address: "10.77.82.1/30",
+            listen: "127.0.0.1:31201".parse().unwrap(),
+            private_key: private_a,
+            peer_name: "b",
+            peer_address: "10.77.82.2/32",
+            peer_endpoint: old_endpoint,
+            peer_public_key: public_b,
+            psk: [0x53; 32],
+        }))
+        .unwrap();
+        let now = Instant::now();
+
+        let (_, destination, _, _) = take_send(engine.initiate_handshake("b", now).unwrap());
+        assert_eq!(destination, old_endpoint);
+        assert!(engine.has_pending_handshake("b"));
+
+        assert!(engine.update_resolved_endpoint("b", new_endpoint).unwrap());
+        assert!(!engine.has_pending_handshake("b"));
+        assert!(!engine.update_resolved_endpoint("b", new_endpoint).unwrap());
+
+        let (_, destination, _, _) = take_send(
+            engine
+                .initiate_handshake("b", now + Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert_eq!(destination, new_endpoint);
     }
 }

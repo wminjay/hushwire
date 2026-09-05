@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" name="viewport"/>
+<title>HushWire - Automatic Recovery</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#eff6ff',
+                            100: '#dbeafe',
+                            200: '#bfdbfe',
+                            300: '#93c5fd',
+                            400: '#60a5fa',
+                            500: '#3b82f6',
+                            600: '#2563eb', // text-blue-600
+                            700: '#1d4ed8',
+                            800: '#1e40af',
+                            900: '#1e3a8a',
+                            950: '#172554',
+                        },
+                        amber: {
+                            50: '#fffbeb',
+                            100: '#fef3c7',
+                            200: '#fde68a',
+                            300: '#fcd34d',
+                            400: '#fbbf24',
+                            500: '#f59e0b',
+                            600: '#d97706',
+                            700: '#b45309',
+                            800: '#92400e',
+                            900: '#78350f',
+                            950: '#451a03',
+                        },
+                        slate: {
+                            50: '#f8fafc',
+                            100: '#f1f5f9',
+                            200: '#e2e8f0', // border-slate-200
+                            300: '#cbd5e1',
+                            400: '#94a3b8', // text-slate-400
+                            500: '#64748b',
+                            600: '#475569',
+                            700: '#334155',
+                            800: '#1e293b',
+                            900: '#0f172a', // text-slate-900
+                            950: '#020617',
+                        }
+                    },
+                    fontFamily: {
+                        headline: ["Inter", "sans-serif"],
+                        display: ["Inter", "sans-serif"],
+                        body: ["Inter", "sans-serif"],
+                        label: ["Inter", "sans-serif"]
+                    },
+                    spacing: {
+                        'safe-top': 'env(safe-area-inset-top)',
+                        'safe-bottom': 'env(safe-area-inset-bottom)',
+                        'safe-left': 'env(safe-area-inset-left)',
+                        'safe-right': 'env(safe-area-inset-right)',
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        body {
+            -webkit-tap-highlight-color: transparent;
+            background-color: #f8fafc; /* near-white canvas */
+            color: #0f172a;
+        }
+
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+
+        .material-symbols-outlined.fill-icon {
+            font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+
+        /* Pulse animation for recovery state */
+        @keyframes subtle-pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+
+        .animate-subtle-pulse {
+            animation: subtle-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        @keyframes spinner {
+            to { transform: rotate(360deg); }
+        }
+
+        .animate-spin-slow {
+            animation: spinner 3s linear infinite;
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="font-body antialiased selection:bg-primary-200 w-full min-h-screen flex flex-col items-center justify-start overflow-x-hidden pt-[calc(env(safe-area-inset-top)+44px)] pb-[calc(env(safe-area-inset-bottom)+49px)]">
+<!-- TopAppBar -->
+<header class="fixed top-0 w-full z-50 bg-white/80 backdrop-blur-md border-b border-slate-200 flex items-center justify-between px-4 h-11 pt-safe-top">
+<button aria-label="Security Settings" class="w-8 h-8 flex items-center justify-center active:opacity-60 transition-opacity">
+<span class="material-symbols-outlined text-primary-600">shield_lock</span>
+</button>
+<h1 class="font-headline font-semibold text-[17px] tracking-tight text-slate-900 truncate flex-1 text-center">HushWire</h1>
+<button aria-label="Settings" class="w-8 h-8 flex items-center justify-center active:opacity-60 transition-opacity">
+<span class="material-symbols-outlined text-primary-600">settings</span>
+</button>
+</header>
+<!-- Main Content Container (constrained to iPhone width for this demo) -->
+<main class="w-full max-w-[390px] flex-1 flex flex-col px-4 py-6 space-y-6">
+<!-- Profile Selector -->
+<div class="w-full flex justify-center">
+<button class="flex items-center space-x-2 bg-white border border-slate-200 rounded-full px-4 py-2 shadow-sm active:bg-slate-50 transition-colors h-[44px]">
+<span class="font-medium text-[15px] text-slate-900">台湾测试节点</span>
+<span class="material-symbols-outlined text-slate-400 text-lg">expand_more</span>
+</button>
+</div>
+<!-- Connection Status Area -->
+<div class="flex flex-col items-center pt-4 pb-2 space-y-4">
+<!-- Central Shield (Recovery State - Amber) -->
+<div class="relative w-28 h-28 flex items-center justify-center">
+<!-- Background Pulse -->
+<div class="absolute inset-0 bg-amber-100 rounded-full animate-subtle-pulse scale-110 blur-md"></div>
+<!-- Core Shield -->
+<div class="relative w-24 h-24 bg-amber-500 rounded-[2rem] flex items-center justify-center shadow-md rotate-45">
+<span class="material-symbols-outlined fill-icon text-white text-5xl -rotate-45">shield</span>
+</div>
+<!-- Status Indicator (Amber Spinner) -->
+<div class="absolute bottom-1 right-1 w-7 h-7 bg-white rounded-full flex items-center justify-center shadow-sm border border-amber-100">
+<span class="material-symbols-outlined text-amber-500 text-[18px] animate-spin-slow">autorenew</span>
+</div>
+</div>
+<!-- Status Text -->
+<div class="flex flex-col items-center space-y-1 text-center">
+<h2 class="font-headline font-semibold text-2xl text-slate-900 tracking-tight">正在恢复连接</h2>
+<p class="font-body text-[15px] text-slate-500 font-medium">最近握手 92 秒前</p>
+</div>
+<!-- Recovery Panel -->
+<div class="w-full max-w-[320px] bg-amber-50 border border-amber-200 rounded-xl p-3 flex items-start space-x-3 shadow-sm mt-2">
+<span class="material-symbols-outlined text-amber-600 mt-0.5">warning</span>
+<div class="flex-1 flex flex-col">
+<span class="font-medium text-[14px] text-amber-900">对端暂时无响应</span>
+<span class="text-[13px] text-amber-700 leading-snug mt-0.5">正在重新解析 Endpoint 并建立新会话</span>
+</div>
+<!-- Indeterminate progress bar -->
+<div class="w-full h-1 bg-amber-200/50 rounded-full overflow-hidden absolute bottom-0 left-0">
+<div class="h-full bg-amber-500/80 w-1/3 rounded-full animate-[pulse_1.5s_ease-in-out_infinite] translate-x-full"></div>
+</div>
+</div>
+</div>
+<!-- Metric Grid -->
+<div class="grid grid-cols-2 gap-3 w-full">
+<!-- Traffic Sent -->
+<div class="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm flex flex-col space-y-1">
+<div class="flex items-center space-x-1.5 text-slate-500">
+<span class="material-symbols-outlined text-[16px]">arrow_upward</span>
+<span class="text-[13px] font-medium">发送</span>
+</div>
+<div class="flex items-baseline space-x-1">
+<span class="font-display font-semibold text-lg text-slate-900 tabular-nums">0</span>
+<span class="text-[13px] text-slate-500 font-medium">B/s</span>
+</div>
+<div class="text-[12px] text-slate-400 mt-1 tabular-nums">已发送 128 MB</div>
+</div>
+<!-- Traffic Received -->
+<div class="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm flex flex-col space-y-1">
+<div class="flex items-center space-x-1.5 text-slate-500">
+<span class="material-symbols-outlined text-[16px]">arrow_downward</span>
+<span class="text-[13px] font-medium">接收</span>
+</div>
+<div class="flex items-baseline space-x-1">
+<span class="font-display font-semibold text-lg text-slate-900 tabular-nums">0</span>
+<span class="text-[13px] text-slate-500 font-medium">B/s</span>
+</div>
+<div class="text-[12px] text-slate-400 mt-1 tabular-nums">已接收 1.7 GB</div>
+</div>
+</div>
+<!-- Technical Details List -->
+<div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden flex flex-col w-full">
+<!-- Route Impact Card -->
+<div class="flex items-center justify-between p-4 border-b border-slate-100">
+<div class="flex items-center space-x-3">
+<div class="w-8 h-8 rounded-full bg-slate-50 flex items-center justify-center">
+<span class="material-symbols-outlined text-slate-500 text-[18px]">route</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[15px] font-medium text-slate-900">仅指定地址</span>
+<span class="text-[13px] text-slate-500">默认路由与 DNS 未修改</span>
+</div>
+</div>
+</div>
+<!-- Connection Details Card -->
+<div class="flex items-center justify-between p-4">
+<div class="flex items-center space-x-3">
+<div class="w-8 h-8 rounded-full bg-slate-50 flex items-center justify-center">
+<span class="material-symbols-outlined text-slate-500 text-[18px]">dns</span>
+</div>
+<div class="flex flex-col">
+<span class="text-[15px] font-medium text-slate-900 font-mono text-[14px]">154.40.60.58:27783</span>
+<span class="text-[13px] text-slate-500">UDP · MTU 1280</span>
+</div>
+</div>
+<div class="bg-amber-100 text-amber-700 text-[11px] font-medium px-2 py-0.5 rounded-full flex items-center space-x-1">
+<span class="material-symbols-outlined text-[12px]">sync</span>
+<span>自动恢复中</span>
+</div>
+</div>
+</div>
+<!-- Primary Action -->
+<div class="pt-4 pb-2 w-full">
+<button class="w-full h-[50px] rounded-xl border-2 border-slate-200 bg-white text-slate-900 font-semibold text-[17px] flex items-center justify-center active:bg-slate-50 transition-colors">
+                断开连接
+            </button>
+</div>
+</main>
+<!-- BottomNavBar -->
+<nav class="fixed bottom-0 left-0 w-full h-[49px] pb-safe-bottom bg-white/80 backdrop-blur-md border-t border-slate-200 z-50">
+<div class="flex justify-around items-center h-[49px] px-2 w-full max-w-[390px] mx-auto">
+<!-- Active Tab: 连接 -->
+<button aria-label="连接" class="flex flex-col items-center justify-center text-primary-600 active:bg-slate-50 w-full h-full rounded-lg transition-colors">
+<span class="material-symbols-outlined fill-icon text-[24px] mb-0.5">bolt</span>
+<span class="font-label text-[10px] font-medium">连接</span>
+</button>
+<!-- Inactive Tab: 配置 -->
+<button aria-label="配置" class="flex flex-col items-center justify-center text-slate-400 active:bg-slate-50 w-full h-full rounded-lg transition-colors">
+<span class="material-symbols-outlined text-[24px] mb-0.5">tune</span>
+<span class="font-label text-[10px] font-medium">配置</span>
+</button>
+<!-- Inactive Tab: 诊断 -->
+<button aria-label="诊断" class="flex flex-col items-center justify-center text-slate-400 active:bg-slate-50 w-full h-full rounded-lg transition-colors">
+<span class="material-symbols-outlined text-[24px] mb-0.5">analytics</span>
+<span class="font-label text-[10px] font-medium">诊断</span>
+</button>
+</div>
+</nav>
+</body></html>

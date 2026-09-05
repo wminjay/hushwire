@@ -45,6 +45,22 @@ macos/scripts/test-core-xcframework.sh
 
 The daemon creates a TUN interface, installs host routes, and tears everything down on shutdown. Two peers with matching configs (exchanged public keys + shared PSK) can ping each other's tunnel IPs once the transport port is reachable between them.
 
+## iOS Client
+
+The native SwiftUI iOS client and embedded Packet Tunnel extension live in
+[`ios/`](ios/README.md). It supports multiple Keychain-backed local profiles,
+one active tunnel, route/DNS impact review, authenticated-preflight protection,
+and redacted live diagnostics. Generate the project and iOS Rust XCFramework
+with:
+
+```sh
+ios/scripts/generate-project.sh
+open ios/HushWireIOS.xcodeproj
+```
+
+The UI and Rust linkage can be tested in Simulator; an actual tunnel and the
+system VPN authorization must be tested on a signed physical iPhone.
+
 ## Overview
 
 - create a TUN interface
